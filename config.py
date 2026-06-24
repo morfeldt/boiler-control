@@ -1,7 +1,6 @@
 # ============================================================
-# config.example.py – Boiler controller configuration template
-# Copy this file to config.py and fill in your own values.
-# config.py is gitignored — never commit it with real values.
+# config.py – Boiler controller configuration (real values)
+# This file is gitignored — never commit it.
 # ============================================================
 
 # --- Electricity price and optimization ---
@@ -14,8 +13,8 @@ MAX_CONSEC_OFF_QUARTERS = 8    # Max consecutive off quarters — only used as f
                                 # when the boiler temp sensor is unavailable (8 ≈ 2h)
 
 # --- Shelly controlling the boiler (G3 Plus 1) ---
-BOILER_SHELLY_IP  = "192.168.1.XX"   # Static IP set in router
-BOILER_SHELLY_GEN = 2                 # 2 = Plus 1 / G3 Plus 1 (Gen2/Gen3 share the same API)
+BOILER_SHELLY_IP  = "10.0.1.5"   # Static IP set in router
+BOILER_SHELLY_GEN = 2             # 2 = Plus 1 / G3 Plus 1 (Gen2/Gen3 share the same API)
 
 # --- Shelly Add-on DS18B20 sensor indices ---
 # The Add-on is attached to the boiler Shelly and shares its IP.
@@ -48,14 +47,14 @@ SEASON_CHANGE_READINGS       = 8      # Consecutive readings needed to flip seas
 SEASON_INFERENCE_THRESHOLD_C = 65.0   # Corrected boiler temp above which = winter
 
 # --- Shelly H&T (temperature sensor — fallback for indoor temp) ---
-HT_SHELLY_IP  = "192.168.1.YY"   # Static IP set in router
-HT_SHELLY_GEN = 1                 # 1 = H&T original, 2 = Plus H&T
+HT_SHELLY_IP  = "10.0.1.6"   # Static IP set in router
+HT_SHELLY_GEN = 1             # 1 = H&T original, 2 = Plus H&T
 
 # --- Shelly Cloud (fallback when H&T is asleep / unreachable locally) ---
 # Obtained via the Shelly app → User Settings → Authorization cloud key
 CLOUD_AUTH_KEY = "YOUR_AUTH_KEY_HERE"           # Paste your auth_key
 CLOUD_SERVER   = "shelly-XX-eu.shelly.cloud"    # Paste your server name
-HT_DEVICE_ID   = "XXXXXX"                        # Last 6 hex chars of the H&T's MAC, lowercase
+HT_DEVICE_ID   = "e4cfd3"                        # Last 6 hex chars of the H&T's MAC, lowercase
 
 # --- Frost protection ---
 FROST_GUARD_C      = 10.0   # Always keep boiler ON when indoor temp is below this
