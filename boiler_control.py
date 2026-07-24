@@ -42,6 +42,7 @@ from config import (
     SEASON_OVERRIDE, SEASON_CHANGE_READINGS, SEASON_INFERENCE_THRESHOLD_C,
     BOILER_MIN_TEMP_SUMMER_C, BOILER_MIN_TEMP_WINTER_C,
     FROST_GUARD_C, MAX_TEMP_AGE_HOURS,
+    SERVER_HEARTBEAT_URL, SERVER_HEARTBEAT_TOKEN,
     STATE_FILE, LOG_FILE, SCHEDULE_FILE,
 )
 
@@ -414,6 +415,48 @@ def set_boiler(on: bool) -> None:
     r.raise_for_status()
 
 
+# ── Watchdog heartbeats ───────────────────────────────────────────────────────
+
+def write_shelly_heartbeat() -> None:
+    """
+    Writes a Unix timestamp to the Shelly's KVS as a local watchdog heartbeat.
+    The Shelly watchdog script reads this every minute and forces the boiler ON
+    if the Pi has been silent for more than WATCHDOG_TIMEOUT_SECS.
+    Works purely over the local network — not affected by internet outages.
+    """
+    try:
+        requests.get(
+            f"http://{BOILER_SHELLY_IP}/rpc/KVS.Set",
+            params={
+                "key":   "pi_heartbeat",
+                "value": int(datetime.now().timestamp()),
+            },
+            timeout=5,
+        )
+    except Exception as e:
+        logging.warning(f"Could not write Shelly KVS heartbeat: {e}")
+
+
+def ping_server() -> None:
+    """
+    Sends a keep-alive ping to morfeldt.se so the cPanel cron watchdog
+    can detect if the Pi goes down and send an email alert.
+    This is notification-only — failures are logged but never affect
+    boiler control. Internet outages will cause false email alerts,
+    which is acceptable given the Shelly watchdog handles real fail-safe.
+    """
+    try:
+        r = requests.get(
+            SERVER_HEARTBEAT_URL,
+            params={"token": SERVER_HEARTBEAT_TOKEN},
+            timeout=5,
+        )
+        if r.status_code != 200:
+            logging.warning(f"Server heartbeat returned HTTP {r.status_code}")
+    except Exception as e:
+        logging.warning(f"Could not ping server heartbeat: {e}")
+
+
 # ── Main logic ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -464,6 +507,12 @@ def main() -> None:
         save_state(state)
         set_boiler(True)
         return
+
+    # Write heartbeats now that we know the Pi is alive and running normally.
+    # Shelly KVS heartbeat: local network only, drives the Shelly fail-safe script.
+    # Server ping: internet-dependent, drives the cPanel email watchdog.
+    write_shelly_heartbeat()
+    ping_server()
 
     # 5. Get indoor temperature (DS18B20 → H&T chain → saved state)
     indoor_temp, indoor_time, indoor_fresh = get_indoor_temp(raw_indoor, state, now)

@@ -39,7 +39,10 @@ G3 Plus 1 enclosure. Power must be off when installing it.
 boiler/
 ├── config.example.py    ← Template – copy to config.py and fill in your values
 ├── config.py            ← Your actual settings (gitignored, never commit this)
-├── boiler_control.py    ← Main script
+├── boiler_control.py    ← Main Pi script
+├── shelly_watchdog.js   ← Watchdog script to install on the Shelly G3 Plus 1
+├── heartbeat.php        ← Upload to your web server (receives Pi pings)
+├── watchdog.php         ← Upload to your web server (run via cPanel cron)
 ├── boiler_state.json    ← Created automatically (persisted state: temps, season)
 ├── schedule.csv         ← Today's on/off plan, overwritten every 15 min
 └── boiler.log           ← Log of every decision
@@ -109,6 +112,12 @@ BOILER_MIN_TEMP_SUMMER_C     = 55.0   # Boiler forced ON below this in summer
 BOILER_MIN_TEMP_WINTER_C     = 68.0   # Boiler forced ON below this in winter
 ```
 
+**Watchdog heartbeats:**
+```python
+SERVER_HEARTBEAT_URL   = "https://yoursite.com/boiler/heartbeat.php"
+SERVER_HEARTBEAT_TOKEN = "REPLACE_WITH_YOUR_SECRET_TOKEN"  # must match heartbeat.php
+```
+
 **Shelly H&T fallback** (used if DS18B20 indoor sensor is unavailable):
 
 The original Shelly H&T sleeps between reports to save battery, making
@@ -166,6 +175,42 @@ In the Shelly app → G3 Plus 1 → Settings → Power On Default Mode →
 set to **ON**. This ensures the boiler turns on if the Shelly loses
 power and restores, regardless of what state it was in before.
 
+### 8. Set up web server watchdog
+
+Upload `heartbeat.php` and `watchdog.php` to `public_html/boiler/` on
+your web server. Edit `heartbeat.php` and set `SECRET_TOKEN` to the same
+value as `SERVER_HEARTBEAT_TOKEN` in `config.py`.
+
+Test the endpoint from the command line:
+```bash
+# Should return HTTP 200 and write a timestamp file
+curl -v "https://yoursite.com/boiler/heartbeat.php?token=YOUR_TOKEN"
+
+# Should return a Unix timestamp
+curl "https://yoursite.com/boiler/last_heartbeat.txt"
+
+# Should produce no output when heartbeat is fresh
+/usr/local/bin/php ~/public_html/boiler/watchdog.php
+```
+
+Add the cPanel cron job (every 30 minutes):
+```
+*/30 * * * *   /usr/local/bin/php /home/YOUR_CPANEL_USERNAME/public_html/boiler/watchdog.php
+```
+
+cPanel emails the output to your account address whenever the script
+produces output — i.e. only when the Pi has been silent for >30 minutes.
+
+### 9. Install Shelly watchdog script
+
+In the Shelly app → G3 Plus 1 → Scripts → Create new script.
+Paste the contents of `shelly_watchdog.js` and enable it.
+
+The script runs a timer every minute on the Shelly itself, reads the
+Pi's heartbeat from local KVS, and forces the boiler ON if the Pi has
+been silent for 45 minutes while the boiler is OFF. This works entirely
+over the local network and is not affected by internet outages.
+
 ---
 
 ## How it works
@@ -210,6 +255,26 @@ Indoor temperature is read in four steps, descending reliability:
 If indoor temperature falls below `FROST_GUARD_C`, the boiler is forced
 ON regardless of price or schedule.
 
+### Watchdog system
+
+Two independent watchdogs protect against Pi crashes, operating at
+different layers:
+
+**Local watchdog (Shelly script):** The Pi writes a Unix timestamp to
+the Shelly's KVS on every run. A script running on the Shelly reads this
+every minute. If the timestamp is stale (>45 minutes) and the boiler is
+OFF, the boiler is forced ON. This works entirely over the local network
+and is unaffected by internet outages — it is the primary boiler
+fail-safe for a Pi crash.
+
+**Remote watchdog (web server + cPanel cron):** The Pi also pings a PHP
+endpoint on your web server on every run. A cron job runs the watchdog
+script every 30 minutes; if the last ping is older than 30 minutes, an
+email alert is sent. This is notification-only — it tells you the Pi is
+down so you can investigate, but does not control the boiler. Internet
+outages will trigger false alerts, which are safe to ignore since the
+local Shelly watchdog handles the actual boiler fail-safe.
+
 ### Schedule file
 
 `schedule.csv` is overwritten every run with today's complete plan:
@@ -239,7 +304,7 @@ optimized away.
 
 ## Fail-safe behavior
 
-The script is designed to never leave the house unprotected:
+The system is designed to never leave the house unprotected:
 
 | Situation | What happens |
 |---|---|
@@ -250,7 +315,11 @@ The script is designed to never leave the house unprotected:
 | All indoor temp sources too old | Boiler ON |
 | DS18B20 boiler sensor unavailable | Falls back to `MAX_CONSEC_OFF_QUARTERS` constraint |
 | Unexpected program error | Boiler ON |
+| Pi crashes while boiler is OFF | Shelly watchdog forces ON after 45 min |
+| Pi crashes while boiler is ON | Boiler stays ON (no action needed) |
 | Pi or router loses power | Shelly "Power On Default Mode" = ON |
+| Pi down (notification) | Email alert after 30 min via cPanel cron |
+| Internet outage (false alert) | Email sent, safe to ignore — local watchdog unaffected |
 
 ---
 
@@ -276,6 +345,12 @@ The script falls back to the `MAX_CONSEC_OFF_QUARTERS` constraint —
 the same time-based approach used before the sensor was added. A warning
 is logged and the season defaults to the last known value (or "winter"
 if unknown, which applies the safer higher threshold).
+
+**I got a watchdog email but the boiler seems fine — what happened?**
+Most likely a brief internet outage at the house. The local Shelly
+watchdog handles the actual boiler fail-safe independently of the
+internet. Check the Pi is running (`ssh` in and check the log) and
+ignore the alert if everything looks normal.
 
 **Can I view the logs nicely?**
 ```bash
@@ -314,3 +389,7 @@ cat /home/boiler/boiler/schedule.csv
   provides useful context for understanding how quickly the boiler cools
   under different heat demand conditions. After a full season of data,
   this could inform more sophisticated control logic.
+- **Remote watchdog false alarms on internet outage** — the cPanel email
+  watchdog cannot distinguish between a Pi crash and a home internet
+  outage. The local Shelly watchdog handles actual boiler safety; the
+  email alert is informational only.

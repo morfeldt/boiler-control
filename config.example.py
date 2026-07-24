@@ -57,7 +57,18 @@ CLOUD_AUTH_KEY = "YOUR_AUTH_KEY_HERE"           # Paste your auth_key
 CLOUD_SERVER   = "shelly-XX-eu.shelly.cloud"    # Paste your server name
 HT_DEVICE_ID   = "XXXXXX"                        # Last 6 hex chars of the H&T's MAC, lowercase
 
-# --- Frost protection ---
+# --- Remote watchdog (Pi → your web server) ---
+# The Pi pings your web server every 15 minutes so the cPanel cron watchdog
+# can detect if the Pi goes down and send an email alert.
+# This is notification-only — the Shelly watchdog script handles the
+# actual boiler fail-safe independently and is not affected by internet outages.
+SERVER_HEARTBEAT_URL   = "https://yoursite.com/boiler/heartbeat.php"
+SERVER_HEARTBEAT_TOKEN = "REPLACE_WITH_YOUR_SECRET_TOKEN"   # must match heartbeat.php
+
+# --- Local watchdog (Pi → Shelly KVS) ---
+# The Pi also writes a heartbeat to the Shelly's KVS so the Shelly watchdog
+# script can force the boiler ON if the Pi crashes. This works purely over
+# the local network and is not affected by internet outages.
 FROST_GUARD_C      = 10.0   # Always keep boiler ON when indoor temp is below this
 MAX_TEMP_AGE_HOURS = 4      # If all indoor temp sources are older than this → fail-safe ON
 
