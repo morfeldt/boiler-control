@@ -69,8 +69,36 @@ SERVER_HEARTBEAT_TOKEN = "REPLACE_WITH_YOUR_SECRET_TOKEN"   # must match heartbe
 # The Pi also writes a heartbeat to the Shelly's KVS so the Shelly watchdog
 # script can force the boiler ON if the Pi crashes. This works purely over
 # the local network and is not affected by internet outages.
-FROST_GUARD_C      = 10.0   # Always keep boiler ON when indoor temp is below this
+FROST_GUARD_C      = 6.0   # Always keep boiler ON when indoor temp is below this
 MAX_TEMP_AGE_HOURS = 4      # If all indoor temp sources are older than this → fail-safe ON
+
+# --- Occupancy ---
+# Written by the Homebridge virtual switch (homebridge-cmdswitch2).
+# "home" = normal operation, "away" = reduced/off mode.
+# Defaults to "home" if the file is missing — Pi reboot always returns to home mode.
+OCCUPANCY_FILE = "/home/boiler/boiler/occupancy.txt"
+
+# --- Outside temperature (Open-Meteo API, free, no API key) ---
+# Used in Away + Winter mode to force heating if it gets cold outside.
+WEATHER_LAT = 0.0000   # Property latitude
+WEATHER_LON = 0.0000   # Property longitude
+
+# Thresholds for Away + Winter mode.
+# When frost risk is detected, the full Home mode system activates (price
+# schedule + all guards). When temperatures recover, it deactivates back to
+# fully OFF. Hysteresis prevents cycling: separate activate/deactivate thresholds.
+#
+# Activation (either triggers full Home mode):
+#   - indoor < ACTIVATE_INDOOR_C  (house is getting cold)
+#   - outside < ACTIVATE_OUTSIDE_C (preemptive — boiler needs time to heat up)
+#
+# Deactivation (both must recover before turning OFF again):
+#   - indoor > DEACTIVATE_INDOOR_C
+#   - outside > DEACTIVATE_OUTSIDE_C
+AWAY_WINTER_ACTIVATE_INDOOR_C    = 6.0
+AWAY_WINTER_DEACTIVATE_INDOOR_C  = 9.0
+AWAY_WINTER_ACTIVATE_OUTSIDE_C   = 5.0
+AWAY_WINTER_DEACTIVATE_OUTSIDE_C = 10.0
 
 # --- Files ---
 STATE_FILE    = "/home/boiler/boiler/boiler_state.json"

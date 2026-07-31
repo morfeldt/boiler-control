@@ -11,6 +11,11 @@ heater's runtime toward cheap price periods while guaranteeing the boiler
 water temperature never drops too low, and to never freeze the house if
 anything in the chain fails.
 
+Occupancy is set via a virtual switch in Apple Home (Homebridge +
+homebridge-cmdswitch2). When away in summer the boiler is fully off.
+When away in winter the boiler is off unless frost risk is detected,
+at which point the full price-optimised home mode activates automatically.
+
 ---
 
 ## Hardware
@@ -112,6 +117,24 @@ BOILER_MIN_TEMP_SUMMER_C     = 55.0   # Boiler forced ON below this in summer
 BOILER_MIN_TEMP_WINTER_C     = 68.0   # Boiler forced ON below this in winter
 ```
 
+**Occupancy and weather** — set the coordinates for the property
+(used by the Open-Meteo API for outside temperature in Away+Winter mode)
+and tune the frost protection thresholds:
+```python
+OCCUPANCY_FILE = "/home/boiler/boiler/occupancy.txt"  # written by Homebridge switch
+
+WEATHER_LAT = 0.0000   # property latitude
+WEATHER_LON = 0.0000   # property longitude
+
+# Away + Winter frost protection thresholds (hysteresis)
+# Activate full home mode when either drops below the activate threshold.
+# Deactivate only when both recover above the deactivate threshold.
+AWAY_WINTER_ACTIVATE_INDOOR_C    = 12.0
+AWAY_WINTER_DEACTIVATE_INDOOR_C  = 16.0
+AWAY_WINTER_ACTIVATE_OUTSIDE_C   = 5.0
+AWAY_WINTER_DEACTIVATE_OUTSIDE_C = 8.0
+```
+
 **Watchdog heartbeats:**
 ```python
 SERVER_HEARTBEAT_URL   = "https://yoursite.com/boiler/heartbeat.php"
@@ -148,9 +171,9 @@ LANG=en_US.UTF-8 tail -3 /home/boiler/boiler/boiler.log
 
 Expected log output:
 ```
-2026-01-15 03:00  Quarter 03:00 | Indoor: 18.5°C (read 03:00) | Boiler: 72.3°C | Feed: 45.1°C | Season: winter | 0.312 SEK/kWh | Boiler: OFF (scheduled off (expensive period))
-2026-01-15 08:00  Quarter 08:00 | Indoor: 18.2°C (read 07:55) | Boiler: 65.8°C | Feed: 38.2°C | Season: winter | 1.854 SEK/kWh | Boiler: ON  (boiler temp guard (65.8°C < 68.0°C))
-2026-01-15 09:00  Quarter 09:00 | Indoor: 7.8°C  (read 09:00) | Boiler: 71.2°C | Feed: 42.0°C | Season: winter | 2.100 SEK/kWh | Boiler: ON  (frost guard (7.8°C < 10.0°C))
+2026-01-15 03:00  Quarter 03:00 | Occupancy: home | Indoor: 18.5°C (read 03:00) | Outside: n/a | Boiler: 72.3°C | Feed: 45.1°C | Season: winter | 0.312 SEK/kWh | Boiler: OFF (scheduled off (expensive period))
+2026-01-15 08:00  Quarter 08:00 | Occupancy: home | Indoor: 18.2°C (read 07:55) | Outside: n/a | Boiler: 65.8°C | Feed: 38.2°C | Season: winter | 1.854 SEK/kWh | Boiler: ON  (boiler temp guard (65.8°C < 68.0°C))
+2026-01-15 02:00  Quarter 02:00 | Occupancy: away | Indoor: 11.2°C (read 01:55) | Outside: 3.1°C | Boiler: 52.3°C | Feed: 28.1°C | Season: winter | 0.218 SEK/kWh | Boiler: OFF (away+winter frost protection active — scheduled off (expensive period))
 ```
 
 ### 6. Add to cron
@@ -211,9 +234,92 @@ Pi's heartbeat from local KVS, and forces the boiler ON if the Pi has
 been silent for 45 minutes while the boiler is OFF. This works entirely
 over the local network and is not affected by internet outages.
 
+### 10. Set up Homebridge occupancy switch
+
+The occupancy switch appears in Apple Home and controls whether the
+boiler runs in Home or Away mode.
+
+**Install the plugin** via the Homebridge UI: Plugins → search
+`homebridge-cmdswitch2` → Install.
+
+**Fix permissions** so Homebridge can write the occupancy file:
+```bash
+sudo usermod -a -G boiler homebridge
+sudo chmod g+w /home/boiler/boiler
+sudo -u boiler sh -c 'echo home > /home/boiler/boiler/occupancy.txt'
+sudo chmod 664 /home/boiler/boiler/occupancy.txt
+sudo systemctl restart homebridge
+```
+
+Verify with:
+```bash
+groups homebridge   # should include 'boiler'
+sudo -u homebridge sh -c 'echo away > /home/boiler/boiler/occupancy.txt'
+cat /home/boiler/boiler/occupancy.txt   # should show: away
+sudo -u homebridge sh -c 'echo home > /home/boiler/boiler/occupancy.txt'
+```
+
+**Add to Homebridge `config.json`** (Config tab in Homebridge UI,
+add to the `platforms` array):
+```json
+{
+    "platform": "cmdSwitch2",
+    "name": "CMD Switch",
+    "switches": [
+        {
+            "name": "Stuga - Hemma",
+            "on_cmd": "echo home > /home/boiler/boiler/occupancy.txt",
+            "off_cmd": "echo away > /home/boiler/boiler/occupancy.txt",
+            "state_cmd": "grep -q home /home/boiler/boiler/occupancy.txt",
+            "polling": false,
+            "timeout": 5
+        }
+    ]
+}
+```
+
+In Apple Home: switch **ON** = Home (normal operation),
+switch **OFF** = Away (reduced/off mode).
+
+The occupancy file persists across Pi reboots. If the file is missing,
+the script defaults to "home" — so a Pi crash never accidentally leaves
+the boiler in away mode.
+
 ---
 
 ## How it works
+
+### Occupancy modes
+
+Occupancy is set via a virtual switch in Apple Home (switch ON = Home,
+switch OFF = Away). The state is written to `occupancy.txt` by the
+Homebridge plugin and read on every Pi run.
+
+| Mode | Season | Behaviour |
+|---|---|---|
+| Home | Summer | Price schedule + boiler temp guard + frost guard |
+| Home | Winter | Price schedule + boiler temp guard + frost guard |
+| Away | Summer | Boiler **fully OFF** — no schedule, no guards |
+| Away | Winter | Boiler **fully OFF** unless frost risk detected |
+
+**Away + Winter frost protection** uses hysteresis to avoid cycling.
+Full Home mode activates when either condition is met:
+- Indoor temp drops below `AWAY_WINTER_ACTIVATE_INDOOR_C` (12°C), or
+- Outside temp drops below `AWAY_WINTER_ACTIVATE_OUTSIDE_C` (5°C) —
+  a preemptive trigger, since the boiler needs time to heat up from
+  cold temperatures before it can contribute to frost protection.
+
+Full Home mode deactivates only when both recover:
+- Indoor temp above `AWAY_WINTER_DEACTIVATE_INDOOR_C` (16°C), and
+- Outside temp above `AWAY_WINTER_DEACTIVATE_OUTSIDE_C` (8°C).
+
+The activation state is persisted in the state file so recovery
+heating continues correctly across Pi reboots and power outages.
+
+Outside temperature is fetched from the
+[Open-Meteo API](https://open-meteo.com) (free, no API key required)
+using the property's coordinates. It is only fetched in Away+Winter
+mode — in all other modes `outside` shows as `n/a` in the log.
 
 ### Scheduling
 
@@ -281,7 +387,7 @@ local Shelly watchdog handles the actual boiler fail-safe.
 
 ```
 # Schedule generated: 2026-01-15 09:00:01
-# Season: winter | Boiler min temp: 68.0°C | boiler temp guard active
+# Occupancy: home | Season: winter | Outside: n/a | Boiler min: 68.0°C | boiler temp guard active
 # Off quarters: 64/96 (target 64)
 # ##...####...
 time,price_sek_per_kwh,scheduled,actual
@@ -308,22 +414,42 @@ The system is designed to never leave the house unprotected:
 
 | Situation | What happens |
 |---|---|
-| Spot price API down | Boiler ON |
+| Spot price API down | Boiler ON (except Away+Summer: stays OFF) |
 | DS18B20 indoor sensor unavailable | Falls back to H&T chain |
 | H&T asleep (normal) | Tries Shelly Cloud → uses last known cloud value |
 | H&T asleep AND Cloud down | Uses last saved local value (if <4h old) |
-| All indoor temp sources too old | Boiler ON |
+| All indoor temp sources too old | Boiler ON (except Away+Summer: stays OFF) |
 | DS18B20 boiler sensor unavailable | Falls back to `MAX_CONSEC_OFF_QUARTERS` constraint |
+| Away+Summer, any error | Boiler stays OFF (no frost risk in summer) |
+| Away+Winter, indoor temp unavailable | Frost protection activated as fail-safe → Boiler ON |
+| Away+Winter, outside temp unavailable | Indoor temp alone determines frost risk |
 | Unexpected program error | Boiler ON |
 | Pi crashes while boiler is OFF | Shelly watchdog forces ON after 45 min |
 | Pi crashes while boiler is ON | Boiler stays ON (no action needed) |
 | Pi or router loses power | Shelly "Power On Default Mode" = ON |
 | Pi down (notification) | Email alert after 30 min via cPanel cron |
 | Internet outage (false alert) | Email sent, safe to ignore — local watchdog unaffected |
+| Pi reboots, occupancy file missing | Defaults to "home" — boiler runs normally |
 
 ---
 
 ## FAQ
+
+**How do I switch between Home and Away mode?**
+Toggle the "Stuga - Hemma" switch in Apple Home (or ask Siri). ON =
+Home, OFF = Away. The change takes effect on the next 15-minute Pi run.
+
+**What happens in Away+Winter if it gets cold?**
+When indoor temp drops below 12°C or outside temp drops below 5°C,
+the full Home mode system activates automatically — price schedule,
+boiler temp guard, and frost guard all run as normal. It deactivates
+again only when indoor recovers above 16°C AND outside above 8°C.
+The activation state persists across reboots.
+
+**Why is Outside showing n/a in the log?**
+Outside temperature is only fetched in Away+Winter mode, since that's
+the only mode that uses it. In all other modes it's skipped to avoid
+unnecessary API calls.
 
 **How do I adjust how long the boiler stays on?**
 Change `OFF_QUARTERS_TARGET` in `config.py`. Each unit is 15 minutes;

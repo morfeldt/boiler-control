@@ -1,13 +1,27 @@
 #!/usr/bin/env python3
 """
 boiler_control.py – Controls the immersion heater in a CTC 1100 boiler
-based on the Nordpool day-ahead spot price.
+based on the Nordpool day-ahead spot price and occupancy mode.
 
-Runs every 15 minutes via cron (required since electricity prices moved
-to quarter-hour resolution on 2025-10-01):
+Runs every 15 minutes via cron:
     */15 * * * * python3 /home/boiler/boiler/boiler_control.py
 
-Fail-safe: on any error, the boiler is turned ON — you never freeze.
+Occupancy is set via a Homebridge virtual switch (homebridge-cmdswitch2)
+that writes "home" or "away" to OCCUPANCY_FILE. Defaults to "home" if the
+file is missing — so a Pi reboot or crash always returns to home mode.
+
+Operating modes:
+  Home (summer or winter)
+    Price schedule + boiler temp guard + frost guard
+
+  Away + Winter
+    Price schedule + boiler temp guard + frost guard
+    + outside temp guard (forces ON if outside < threshold)
+    + indoor away guard (forces ON if indoor < threshold)
+
+  Away + Summer
+    Boiler fully OFF — no price schedule, no guards
+    (hot water heats up within ~1h when you switch back to Home)
 
 Sensor priority for indoor/frost temperature:
   1. DS18B20 on Shelly Add-on index 100 (wired, always-on)
@@ -18,12 +32,16 @@ Sensor priority for indoor/frost temperature:
 Boiler temperature guard:
   - DS18B20 on Shelly Add-on index 101, corrected by DS18B20_BOILER_OFFSET
   - If unavailable: falls back to MAX_CONSEC_OFF_QUARTERS constraint
-  - Season (summer/winter) inferred from sustained corrected boiler temp readings,
+  - Season inferred from sustained corrected boiler temp readings,
     or set explicitly via SEASON_OVERRIDE in config
 
 Radiator feed temperature:
   - DS18B20 on Shelly Add-on index 102
   - Logged only, not used for control decisions
+
+Fail-safe: on any error, the boiler is turned ON — you never freeze.
+Exception: Away + Summer mode keeps the boiler OFF on errors since
+frost is not a risk in summer.
 """
 
 import requests
@@ -42,6 +60,10 @@ from config import (
     SEASON_OVERRIDE, SEASON_CHANGE_READINGS, SEASON_INFERENCE_THRESHOLD_C,
     BOILER_MIN_TEMP_SUMMER_C, BOILER_MIN_TEMP_WINTER_C,
     FROST_GUARD_C, MAX_TEMP_AGE_HOURS,
+    OCCUPANCY_FILE,
+    WEATHER_LAT, WEATHER_LON,
+    AWAY_WINTER_ACTIVATE_INDOOR_C, AWAY_WINTER_DEACTIVATE_INDOOR_C,
+    AWAY_WINTER_ACTIVATE_OUTSIDE_C, AWAY_WINTER_DEACTIVATE_OUTSIDE_C,
     SERVER_HEARTBEAT_URL, SERVER_HEARTBEAT_TOKEN,
     STATE_FILE, LOG_FILE, SCHEDULE_FILE,
 )
@@ -67,7 +89,6 @@ def load_state() -> dict:
         return {}
     try:
         data = json.loads(p.read_text())
-        # Backward compatibility: migrate old key names on first load
         if "temp" in data and "indoor_temp" not in data:
             data["indoor_temp"] = data.pop("temp")
         if "timestamp" in data and "indoor_temp_timestamp" not in data:
@@ -120,33 +141,24 @@ def build_off_schedule(prices: list[dict], use_consec_constraint: bool) -> set[s
     chrono = sorted(prices, key=lambda p: p["time_start"])
     n = len(chrono)
     is_off = [False] * n
-
-    # Indices sorted by price, most expensive first
     candidates = sorted(range(n), key=lambda i: chrono[i]["SEK_per_kWh"], reverse=True)
 
     off_count = 0
     for idx in candidates:
         if off_count >= OFF_QUARTERS_TARGET:
             break
-
         is_off[idx] = True
-
         if use_consec_constraint:
-            # Measure the contiguous OFF run around idx
             run = 1
             i = idx - 1
             while i >= 0 and is_off[i]:
-                run += 1
-                i -= 1
+                run += 1; i -= 1
             i = idx + 1
             while i < n and is_off[i]:
-                run += 1
-                i += 1
-
+                run += 1; i += 1
             if run > MAX_CONSEC_OFF_QUARTERS:
-                is_off[idx] = False  # too risky without temp sensor – leave ON
+                is_off[idx] = False
                 continue
-
         off_count += 1
 
     return {chrono[i]["time_start"] for i in range(n) if is_off[i]}
@@ -159,6 +171,8 @@ def write_schedule_file(
     boiler_min_temp: float,
     boiler_temp_available: bool,
     actuals: dict,
+    occupancy: str,
+    outside_temp: float | None,
 ) -> None:
     """
     Writes today's full on/off plan to SCHEDULE_FILE, overwritten each run.
@@ -169,12 +183,12 @@ def write_schedule_file(
       scheduled         – what the price schedule says (ON/OFF)
       actual            – what actually happened (ON/OFF), empty for future quarters
 
-    CSV format with '#'-prefixed header lines for a quick terminal glance;
-    readers that skip '#' lines (e.g. R's readr::read_csv(comment = "#"))
-    get clean tabular data straight away.
+    In Away + Summer mode, all quarters are OFF regardless of price.
+    The schedule is still written for reference (prices visible), but a
+    header note indicates the boiler is off due to occupancy.
     """
-    chrono = sorted(prices, key=lambda p: p["time_start"])
-    bar = "".join("." if p["time_start"] in off_keys else "#" for p in chrono)
+    chrono    = sorted(prices, key=lambda p: p["time_start"])
+    bar       = "".join("." if p["time_start"] in off_keys else "#" for p in chrono)
     off_count = bar.count(".")
 
     constraint_note = (
@@ -182,10 +196,18 @@ def write_schedule_file(
         if boiler_temp_available
         else f"fallback: max consecutive off {MAX_CONSEC_OFF_QUARTERS}"
     )
+    outside_str = f"{outside_temp:.1f}°C" if outside_temp is not None else "n/a"
+    away_note = (
+        " | ⚠ AWAY+SUMMER: boiler fully OFF regardless of schedule"
+        if occupancy == "away" and season == "summer"
+        else ""
+    )
 
     lines = [
         f"# Schedule generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-        f"# Season: {season} | Boiler min temp: {boiler_min_temp}°C | {constraint_note}",
+        f"# Occupancy: {occupancy} | Season: {season} | "
+        f"Outside: {outside_str} | Boiler min: {boiler_min_temp}°C | "
+        f"{constraint_note}{away_note}",
         f"# Off quarters: {off_count}/{len(chrono)} (target {OFF_QUARTERS_TARGET})",
         f"# {bar}",
         "time,price_sek_per_kwh,scheduled,actual",
@@ -226,8 +248,6 @@ def price_for_key(prices: list[dict], key: str) -> float:
 def fetch_addon_temp(index: int) -> float | None:
     """
     Reads a DS18B20 sensor from the Shelly Add-on attached to the boiler Shelly.
-    The Add-on shares the boiler Shelly's IP; sensors appear as Temperature
-    components with indices 100, 101, 102, etc.
     Returns raw °C, or None on any error.
     """
     try:
@@ -244,10 +264,7 @@ def fetch_addon_temp(index: int) -> float | None:
 # ── Indoor temperature (DS18B20 → H&T local → H&T cloud → saved) ─────────────
 
 def fetch_ht_live() -> float | None:
-    """
-    Tries to read directly from the H&T over HTTP.
-    Only works if the device happens to be awake — None otherwise.
-    """
+    """Tries to read directly from the H&T over HTTP. Only works when awake."""
     try:
         if HT_SHELLY_GEN == 1:
             r = requests.get(f"http://{HT_SHELLY_IP}/status", timeout=3)
@@ -255,8 +272,7 @@ def fetch_ht_live() -> float | None:
             return float(r.json()["tmp"]["value"])
         else:
             r = requests.get(
-                f"http://{HT_SHELLY_IP}/rpc/Temperature.GetStatus?id=0",
-                timeout=3,
+                f"http://{HT_SHELLY_IP}/rpc/Temperature.GetStatus?id=0", timeout=3,
             )
             r.raise_for_status()
             return float(r.json()["tC"])
@@ -267,9 +283,7 @@ def fetch_ht_live() -> float | None:
 def fetch_ht_cloud() -> tuple[float, datetime] | None:
     """
     Fetches the last known temperature via Shelly Cloud.
-    Works even while the H&T is asleep. Returns (temp, reading_timestamp)
-    using the device's own '_updated' field so the logged time reflects
-    when the H&T actually took the reading.
+    Works even while the H&T is asleep. Returns (temp, reading_timestamp).
     """
     try:
         r = requests.get(
@@ -278,20 +292,15 @@ def fetch_ht_cloud() -> tuple[float, datetime] | None:
             timeout=10,
         )
         r.raise_for_status()
-        data = r.json()
-
-        device = data["data"]["devices_status"].get(HT_DEVICE_ID)
+        device = r.json()["data"]["devices_status"].get(HT_DEVICE_ID)
         if device is None:
             logging.warning(f"Device {HT_DEVICE_ID} not found in cloud response")
             return None
-
         temp = float(device["tmp"]["value"])
-        updated_str = device.get("_updated")
         try:
-            reading_time = datetime.strptime(updated_str, "%Y-%m-%d %H:%M:%S")
+            reading_time = datetime.strptime(device.get("_updated"), "%Y-%m-%d %H:%M:%S")
         except (TypeError, ValueError):
             reading_time = datetime.now()
-
         return temp, reading_time
     except Exception as e:
         logging.warning(f"Cloud fetch failed: {e}")
@@ -307,27 +316,22 @@ def get_indoor_temp(
     Returns (temp, reading_timestamp, is_reliable) for the indoor temperature.
 
     Priority chain:
-      1. DS18B20 index 100 via Shelly Add-on (wired, always-on, most reliable)
-      2. H&T local HTTP (only when device is awake)
-      3. H&T Shelly Cloud (last reported value, regardless of sleep state)
-      4. Last saved value in state file (stale if older than MAX_TEMP_AGE_HOURS)
-
-    State is updated in-place when a fresh reading is obtained.
+      1. DS18B20 index 100 via Shelly Add-on
+      2. H&T local HTTP
+      3. H&T Shelly Cloud
+      4. Last saved value in state file
     """
-    # 1. DS18B20 via Add-on
     if raw_ds18b20 is not None:
         state["indoor_temp"] = raw_ds18b20
         state["indoor_temp_timestamp"] = now.isoformat()
         return raw_ds18b20, now, True
 
-    # 2. H&T local
     live = fetch_ht_live()
     if live is not None:
         state["indoor_temp"] = live
         state["indoor_temp_timestamp"] = now.isoformat()
         return live, now, True
 
-    # 3. H&T cloud
     cloud = fetch_ht_cloud()
     if cloud is not None:
         temp, reading_time = cloud
@@ -335,7 +339,6 @@ def get_indoor_temp(
         state["indoor_temp_timestamp"] = reading_time.isoformat()
         return temp, reading_time, True
 
-    # 4. Last saved value
     try:
         saved_temp = float(state.get("indoor_temp", 999.0))
         saved_ts   = datetime.fromisoformat(state["indoor_temp_timestamp"])
@@ -344,6 +347,106 @@ def get_indoor_temp(
         return saved_temp, saved_ts, fresh
     except (KeyError, ValueError, TypeError):
         return 999.0, now, False
+
+
+# ── Outside temperature (Open-Meteo API) ──────────────────────────────────────
+
+def get_outside_temp() -> float | None:
+    """
+    Fetches current outside temperature from Open-Meteo (free, no API key).
+    Only called in Away + Winter mode where it's needed for the heating guard.
+    """
+    try:
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude":  WEATHER_LAT,
+                "longitude": WEATHER_LON,
+                "current":   "temperature_2m",
+            },
+            timeout=10,
+        )
+        r.raise_for_status()
+        return float(r.json()["current"]["temperature_2m"])
+    except Exception as e:
+        logging.warning(f"Could not fetch outside temperature: {e}")
+        return None
+
+
+# ── Occupancy ─────────────────────────────────────────────────────────────────
+
+def get_occupancy() -> str:
+    """
+    Reads the occupancy state written by the Homebridge virtual switch.
+    Returns "home" or "away". Defaults to "home" if the file is missing
+    or unreadable — so a Pi reboot or file deletion always returns to
+    home mode, ensuring the boiler is not left fully off unexpectedly.
+    """
+    try:
+        val = Path(OCCUPANCY_FILE).read_text().strip().lower()
+        if val in ("home", "away"):
+            return val
+        logging.warning(f"Unexpected occupancy value '{val}' — defaulting to 'home'")
+        return "home"
+    except Exception:
+        return "home"
+
+
+# ── Away + Winter frost protection state ──────────────────────────────────────
+
+def update_frost_protection(
+    state: dict,
+    indoor_temp: float,
+    outside_temp: float | None,
+) -> bool:
+    """
+    Updates and returns the frost protection activation state for Away+Winter mode.
+
+    When active: the full Home mode system runs (price schedule + all guards).
+    When inactive: boiler is fully OFF, same as Away+Summer.
+
+    Activation (either condition triggers):
+      - indoor_temp < AWAY_WINTER_ACTIVATE_INDOOR_C
+      - outside_temp < AWAY_WINTER_ACTIVATE_OUTSIDE_C (preemptive early warning —
+        the boiler needs time to heat up from low temperatures)
+
+    Deactivation (both conditions must recover):
+      - indoor_temp > AWAY_WINTER_DEACTIVATE_INDOOR_C
+      - outside_temp > AWAY_WINTER_DEACTIVATE_OUTSIDE_C (or unavailable)
+
+    State is persisted in boiler_state.json so recovery heating continues
+    correctly across Pi reboots and power outages.
+    """
+    active = state.get("away_frost_protection_active", False)
+
+    indoor_triggers  = indoor_temp  < AWAY_WINTER_ACTIVATE_INDOOR_C
+    outside_triggers = (outside_temp is not None and
+                        outside_temp < AWAY_WINTER_ACTIVATE_OUTSIDE_C)
+
+    indoor_recovered  = indoor_temp  > AWAY_WINTER_DEACTIVATE_INDOOR_C
+    # If outside temp is unavailable, don't block deactivation on its account
+    outside_recovered = (outside_temp is None or
+                         outside_temp > AWAY_WINTER_DEACTIVATE_OUTSIDE_C)
+
+    if not active and (indoor_triggers or outside_triggers):
+        active = True
+        trigger = (
+            f"indoor {indoor_temp:.1f}°C < {AWAY_WINTER_ACTIVATE_INDOOR_C}°C"
+            if indoor_triggers
+            else f"outside {outside_temp:.1f}°C < {AWAY_WINTER_ACTIVATE_OUTSIDE_C}°C"
+        )
+        logging.info(f"Away+Winter: frost protection ACTIVATED ({trigger})")
+
+    elif active and indoor_recovered and outside_recovered:
+        active = False
+        outside_info = f"{outside_temp:.1f}°C" if outside_temp is not None else "n/a"
+        logging.info(
+            f"Away+Winter: frost protection DEACTIVATED "
+            f"(indoor {indoor_temp:.1f}°C, outside {outside_info})"
+        )
+
+    state["away_frost_protection_active"] = active
+    return active
 
 
 # ── Season inference ──────────────────────────────────────────────────────────
@@ -356,14 +459,8 @@ def determine_season(corrected_boiler_temp: float, state: dict) -> str:
       1. SEASON_OVERRIDE in config ("summer" / "winter") — explicit, always wins
       2. Persisted season in state file, flipped only after
          SEASON_CHANGE_READINGS consecutive readings suggesting the other season.
-         This prevents a momentary boiler temp dip from incorrectly flipping
-         the season mid-winter.
       3. If no history yet: infer directly from current corrected boiler temp.
-
-    Season is inferred as "winter" when corrected boiler temp is at or above
-    SEASON_INFERENCE_THRESHOLD_C, "summer" below it.
     """
-    # 1. Explicit override always wins
     if SEASON_OVERRIDE is not None:
         return SEASON_OVERRIDE
 
@@ -372,24 +469,21 @@ def determine_season(corrected_boiler_temp: float, state: dict) -> str:
         if corrected_boiler_temp >= SEASON_INFERENCE_THRESHOLD_C
         else "summer"
     )
-
     current_season = state.get("season")
 
-    # 3. No history yet — use current reading directly
     if current_season is None:
         state["season"] = suggested
         state["season_consecutive_readings"] = 0
-        logging.info(f"Season initialised to '{suggested}' "
-                     f"(boiler {corrected_boiler_temp:.1f}°C, "
-                     f"threshold {SEASON_INFERENCE_THRESHOLD_C}°C)")
+        logging.info(
+            f"Season initialised to '{suggested}' "
+            f"(boiler {corrected_boiler_temp:.1f}°C, "
+            f"threshold {SEASON_INFERENCE_THRESHOLD_C}°C)"
+        )
         return suggested
 
-    # 2. Sustained-reading logic
     if suggested == current_season:
-        # Reading confirms current season — reset counter
         state["season_consecutive_readings"] = 0
     else:
-        # Reading suggests a flip — increment counter
         count = state.get("season_consecutive_readings", 0) + 1
         state["season_consecutive_readings"] = count
         if count >= SEASON_CHANGE_READINGS:
@@ -439,11 +533,9 @@ def write_shelly_heartbeat() -> None:
 
 def ping_server() -> None:
     """
-    Sends a keep-alive ping to morfeldt.se so the cPanel cron watchdog
+    Sends a keep-alive ping to the web server so the cPanel cron watchdog
     can detect if the Pi goes down and send an email alert.
-    This is notification-only — failures are logged but never affect
-    boiler control. Internet outages will cause false email alerts,
-    which is acceptable given the Shelly watchdog handles real fail-safe.
+    Notification-only — failures never affect boiler control.
     """
     try:
         r = requests.get(
@@ -462,31 +554,26 @@ def ping_server() -> None:
 def main() -> None:
     now = datetime.now()
 
-    # 1. Load persistent state
-    state = load_state()
-
-    # Prune actuals when the calendar day rolls over — they're only meaningful
-    # within a single day's schedule
+    # 1. Load persistent state and prune yesterday's actuals
+    state     = load_state()
     today_str = date.today().isoformat()
     if state.get("actuals_date") != today_str:
         state["actuals"]      = {}
         state["actuals_date"] = today_str
 
     # 2. Read all three DS18B20 sensors from Shelly Add-on
-    raw_indoor  = fetch_addon_temp(DS18B20_INDOOR_INDEX)
-    raw_boiler  = fetch_addon_temp(DS18B20_BOILER_INDEX)
-    raw_feed    = fetch_addon_temp(DS18B20_FEED_INDEX)
+    raw_indoor = fetch_addon_temp(DS18B20_INDOOR_INDEX)
+    raw_boiler = fetch_addon_temp(DS18B20_BOILER_INDEX)
+    raw_feed   = fetch_addon_temp(DS18B20_FEED_INDEX)
 
     # Apply calibration offset to boiler sensor
-    boiler_temp_available  = raw_boiler is not None
-    corrected_boiler_temp  = (raw_boiler + DS18B20_BOILER_OFFSET) if boiler_temp_available else None
+    boiler_temp_available = raw_boiler is not None
+    corrected_boiler_temp = (raw_boiler + DS18B20_BOILER_OFFSET) if boiler_temp_available else None
 
     # 3. Determine season and boiler minimum temperature threshold
     if boiler_temp_available:
         season = determine_season(corrected_boiler_temp, state)
     else:
-        # Can't infer season without boiler temp — use persisted value,
-        # default to "winter" (safer: higher minimum temp threshold)
         season = SEASON_OVERRIDE or state.get("season", "winter")
         logging.warning("Boiler temp sensor unavailable — using persisted/default season")
 
@@ -494,9 +581,15 @@ def main() -> None:
         BOILER_MIN_TEMP_WINTER_C if season == "winter" else BOILER_MIN_TEMP_SUMMER_C
     )
 
-    # 4. Fetch spot prices and build off-schedule
-    # With boiler temp sensor: pure greedy (temp guard handles hot-water safety)
-    # Without boiler temp sensor: greedy with MAX_CONSEC_OFF_QUARTERS constraint
+    # 4. Read occupancy (written by Homebridge virtual switch)
+    occupancy = get_occupancy()
+
+    # 5. Fetch outside temperature — only needed for Away + Winter guard
+    outside_temp = None
+    if occupancy == "away" and season == "winter":
+        outside_temp = get_outside_temp()
+
+    # 6. Fetch spot prices and build schedule
     try:
         prices      = get_prices()
         off_keys    = build_off_schedule(prices, use_consec_constraint=not boiler_temp_available)
@@ -505,67 +598,118 @@ def main() -> None:
     except Exception as e:
         logging.warning(f"Could not fetch spot prices: {e} → fail-safe ON")
         save_state(state)
-        set_boiler(True)
+        # In Away + Summer mode, keep boiler OFF even on price fetch failure
+        # (no frost risk in summer). All other modes fail safe to ON.
+        set_boiler(occupancy != "away" or season != "summer")
         return
 
-    # Write heartbeats now that we know the Pi is alive and running normally.
-    # Shelly KVS heartbeat: local network only, drives the Shelly fail-safe script.
-    # Server ping: internet-dependent, drives the cPanel email watchdog.
+    # Write heartbeats — Pi is alive and running normally
     write_shelly_heartbeat()
     ping_server()
 
-    # 5. Get indoor temperature (DS18B20 → H&T chain → saved state)
+    # 7. Get indoor temperature
     indoor_temp, indoor_time, indoor_fresh = get_indoor_temp(raw_indoor, state, now)
 
-    if not indoor_fresh:
-        logging.warning(
-            f"Indoor temperature data missing or older than {MAX_TEMP_AGE_HOURS}h "
-            f"→ fail-safe ON"
-        )
-        save_state(state)
-        set_boiler(True)
-        return
+    # 8. Mode-based boiler decision
+    if occupancy == "away" and season == "summer":
+        # Away + Summer: boiler fully OFF, no exceptions
+        # No frost risk in summer — don't fail-safe to ON for missing temp data
+        boiler_on = False
+        reasons   = ["away mode (summer) — boiler fully off"]
 
-    # 6. Decide whether the boiler should be on or off
-    scheduled_off      = current_key in off_keys
-    frost_guard        = indoor_temp < FROST_GUARD_C
-    boiler_temp_guard  = (
-        boiler_temp_available and corrected_boiler_temp < boiler_min_temp
-    )
-    boiler_on = (not scheduled_off) or frost_guard or boiler_temp_guard
+    elif occupancy == "away" and season == "winter":
+        # Away + Winter: boiler OFF by default, same as Away+Summer.
+        # When frost risk is detected, the ENTIRE Home mode system activates
+        # (price schedule + boiler temp guard + frost guard). This gives the
+        # boiler time to heat from cold temperatures before it can contribute
+        # to frost protection — much better than reactive on/off at the threshold.
+        # Hysteresis (separate activate/deactivate thresholds) prevents cycling.
+
+        if not indoor_fresh:
+            # Can't assess frost risk without temperature data → activate as fail-safe
+            logging.warning(
+                f"Indoor temp unavailable in Away+Winter mode → "
+                f"activating frost protection as fail-safe"
+            )
+            state["away_frost_protection_active"] = True
+
+        frost_active = update_frost_protection(state, indoor_temp, outside_temp)
+
+        if frost_active:
+            # Run full Home mode — price schedule + all guards
+            scheduled_off     = current_key in off_keys
+            frost_guard       = indoor_temp < FROST_GUARD_C
+            boiler_temp_guard = boiler_temp_available and corrected_boiler_temp < boiler_min_temp
+            boiler_on = (not scheduled_off) or frost_guard or boiler_temp_guard
+
+            reasons = []
+            if frost_guard:
+                reasons.append(f"frost guard ({indoor_temp:.1f}°C < {FROST_GUARD_C}°C)")
+            if boiler_temp_guard:
+                reasons.append(
+                    f"boiler temp guard ({corrected_boiler_temp:.1f}°C < {boiler_min_temp}°C)"
+                )
+            if not frost_guard and not boiler_temp_guard:
+                reasons.append(
+                    "scheduled off (expensive period)" if scheduled_off else "normal operation"
+                )
+            reasons = [f"away+winter frost protection active — {r}" for r in reasons]
+        else:
+            # Temperatures safe — boiler fully OFF
+            boiler_on = False
+            reasons   = ["away mode (winter) — temperatures safe, boiler off"]
+
+    else:
+        # Home mode (summer or winter): price schedule + all guards
+        if not indoor_fresh:
+            logging.warning(
+                f"Indoor temperature data missing or older than {MAX_TEMP_AGE_HOURS}h "
+                f"→ fail-safe ON"
+            )
+            save_state(state)
+            set_boiler(True)
+            return
+
+        scheduled_off     = current_key in off_keys
+        frost_guard       = indoor_temp < FROST_GUARD_C
+        boiler_temp_guard = boiler_temp_available and corrected_boiler_temp < boiler_min_temp
+        boiler_on = (not scheduled_off) or frost_guard or boiler_temp_guard
+
+        reasons = []
+        if frost_guard:
+            reasons.append(f"frost guard ({indoor_temp:.1f}°C < {FROST_GUARD_C}°C)")
+        if boiler_temp_guard:
+            reasons.append(
+                f"boiler temp guard ({corrected_boiler_temp:.1f}°C < {boiler_min_temp}°C)"
+            )
+        if not frost_guard and not boiler_temp_guard:
+            reasons.append(
+                "scheduled off (expensive period)" if scheduled_off else "normal operation"
+            )
 
     set_boiler(boiler_on)
 
-    # 7. Record the actual decision for this quarter, then write the schedule file.
-    # Writing after the decision means the current quarter's actual is always
-    # included — past quarters already have their actuals from previous runs.
+    # 9. Record actual, write schedule file, save state
     state.setdefault("actuals", {})[current_key] = "ON" if boiler_on else "OFF"
     write_schedule_file(
         prices, off_keys, season, boiler_min_temp, boiler_temp_available,
-        state["actuals"],
+        state["actuals"], occupancy, outside_temp,
     )
-
-    # 8. Save state and log the decision
     save_state(state)
 
-    reasons = []
-    if frost_guard:
-        reasons.append(f"frost guard ({indoor_temp:.1f}°C < {FROST_GUARD_C}°C)")
-    if boiler_temp_guard:
-        reasons.append(
-            f"boiler temp guard ({corrected_boiler_temp:.1f}°C < {boiler_min_temp}°C)"
-        )
-    if not frost_guard and not boiler_temp_guard:
-        reasons.append(
-            "scheduled off (expensive period)" if scheduled_off else "normal operation"
-        )
-
-    boiler_str = f"{corrected_boiler_temp:.1f}°C" if boiler_temp_available else "n/a"
-    feed_str   = f"{raw_feed:.1f}°C"              if raw_feed is not None  else "n/a"
+    # 10. Log the decision
+    boiler_str  = f"{corrected_boiler_temp:.1f}°C" if boiler_temp_available else "n/a"
+    feed_str    = f"{raw_feed:.1f}°C"              if raw_feed is not None   else "n/a"
+    outside_str = f"{outside_temp:.1f}°C"          if outside_temp is not None else "n/a"
+    indoor_str  = (
+        f"{indoor_temp:.1f}°C (read {indoor_time.strftime('%H:%M')})"
+        if indoor_fresh else "n/a (stale)"
+    )
 
     logging.info(
         f"Quarter {now.strftime('%H:%M')} | "
-        f"Indoor: {indoor_temp:.1f}°C (read {indoor_time.strftime('%H:%M')}) | "
+        f"Occupancy: {occupancy} | "
+        f"Indoor: {indoor_str} | Outside: {outside_str} | "
         f"Boiler: {boiler_str} | Feed: {feed_str} | "
         f"Season: {season} | {price:.3f} SEK/kWh | "
         f"Boiler: {'ON ' if boiler_on else 'OFF'} ({', '.join(reasons)})"
