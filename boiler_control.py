@@ -584,9 +584,9 @@ def main() -> None:
     # 4. Read occupancy (written by Homebridge virtual switch)
     occupancy = get_occupancy()
 
-    # 5. Fetch outside temperature — only needed for Away + Winter guard
+    # 5. Fetch outside temperature — only needed for Away + Winter guard and logged for Home + Winter for analysis
     outside_temp = None
-    if occupancy == "away" and season == "winter":
+    if season == "winter":
         outside_temp = get_outside_temp()
 
     # 6. Fetch spot prices and build schedule
