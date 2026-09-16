@@ -14,14 +14,11 @@ Operating modes:
   Home (summer or winter)
     Price schedule + boiler temp guard + frost guard
 
-  Away + Winter
-    Price schedule + boiler temp guard + frost guard
-    + outside temp guard (forces ON if outside < threshold)
-    + indoor away guard (forces ON if indoor < threshold)
-
-  Away + Summer
-    Boiler fully OFF — no price schedule, no guards
-    (hot water heats up within ~1h when you switch back to Home)
+  Away (summer or winter)
+    Boiler OFF by default.
+    When frost risk is detected (indoor or outside temp below threshold),
+    the full Home mode system activates (price schedule + all guards).
+    Season is still inferred to select the correct boiler min temp.
 
 Sensor priority for indoor/frost temperature:
   1. DS18B20 on Shelly Add-on index 100 (wired, always-on)
@@ -40,8 +37,6 @@ Radiator feed temperature:
   - Logged only, not used for control decisions
 
 Fail-safe: on any error, the boiler is turned ON — you never freeze.
-Exception: Away + Summer mode keeps the boiler OFF on errors since
-frost is not a risk in summer.
 """
 
 import requests
@@ -197,17 +192,12 @@ def write_schedule_file(
         else f"fallback: max consecutive off {MAX_CONSEC_OFF_QUARTERS}"
     )
     outside_str = f"{outside_temp:.1f}°C" if outside_temp is not None else "n/a"
-    away_note = (
-        " | ⚠ AWAY+SUMMER: boiler fully OFF regardless of schedule"
-        if occupancy == "away" and season == "summer"
-        else ""
-    )
 
     lines = [
         f"# Schedule generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"# Occupancy: {occupancy} | Season: {season} | "
         f"Outside: {outside_str} | Boiler min: {boiler_min_temp}°C | "
-        f"{constraint_note}{away_note}",
+        f"{constraint_note}",
         f"# Off quarters: {off_count}/{len(chrono)} (target {OFF_QUARTERS_TARGET})",
         f"# {bar}",
         "time,price_sek_per_kwh,scheduled,actual",
@@ -584,9 +574,9 @@ def main() -> None:
     # 4. Read occupancy (written by Homebridge virtual switch)
     occupancy = get_occupancy()
 
-    # 5. Fetch outside temperature — only needed for Away + Winter guard and logged for Home + Winter for analysis
+    # 5. Fetch outside temperature — needed for Away mode frost guard; also logged for Home+Winter
     outside_temp = None
-    if season == "winter":
+    if occupancy == "away" or season == "winter":
         outside_temp = get_outside_temp()
 
     # 6. Fetch spot prices and build schedule
@@ -598,9 +588,7 @@ def main() -> None:
     except Exception as e:
         logging.warning(f"Could not fetch spot prices: {e} → fail-safe ON")
         save_state(state)
-        # In Away + Summer mode, keep boiler OFF even on price fetch failure
-        # (no frost risk in summer). All other modes fail safe to ON.
-        set_boiler(occupancy != "away" or season != "summer")
+        set_boiler(True)
         return
 
     # Write heartbeats — Pi is alive and running normally
@@ -611,14 +599,8 @@ def main() -> None:
     indoor_temp, indoor_time, indoor_fresh = get_indoor_temp(raw_indoor, state, now)
 
     # 8. Mode-based boiler decision
-    if occupancy == "away" and season == "summer":
-        # Away + Summer: boiler fully OFF, no exceptions
-        # No frost risk in summer — don't fail-safe to ON for missing temp data
-        boiler_on = False
-        reasons   = ["away mode (summer) — boiler fully off"]
-
-    elif occupancy == "away" and season == "winter":
-        # Away + Winter: boiler OFF by default, same as Away+Summer.
+    if occupancy == "away":
+        # Away mode: boiler OFF by default regardless of season.
         # When frost risk is detected, the ENTIRE Home mode system activates
         # (price schedule + boiler temp guard + frost guard). This gives the
         # boiler time to heat from cold temperatures before it can contribute
@@ -628,7 +610,7 @@ def main() -> None:
         if not indoor_fresh:
             # Can't assess frost risk without temperature data → activate as fail-safe
             logging.warning(
-                f"Indoor temp unavailable in Away+Winter mode → "
+                f"Indoor temp unavailable in away mode → "
                 f"activating frost protection as fail-safe"
             )
             state["away_frost_protection_active"] = True
@@ -653,11 +635,11 @@ def main() -> None:
                 reasons.append(
                     "scheduled off (expensive period)" if scheduled_off else "normal operation"
                 )
-            reasons = [f"away+winter frost protection active — {r}" for r in reasons]
+            reasons = [f"away mode frost protection active — {r}" for r in reasons]
         else:
             # Temperatures safe — boiler fully OFF
             boiler_on = False
-            reasons   = ["away mode (winter) — temperatures safe, boiler off"]
+            reasons   = ["away mode — temperatures safe, boiler off"]
 
     else:
         # Home mode (summer or winter): price schedule + all guards

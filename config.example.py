@@ -79,11 +79,11 @@ MAX_TEMP_AGE_HOURS = 4      # If all indoor temp sources are older than this →
 OCCUPANCY_FILE = "/home/boiler/boiler/occupancy.txt"
 
 # --- Outside temperature (Open-Meteo API, free, no API key) ---
-# Used in Away + Winter mode to force heating if it gets cold outside.
+# Used in Away mode to force heating if it gets cold outside.
 WEATHER_LAT = 0.0000   # Property latitude
 WEATHER_LON = 0.0000   # Property longitude
 
-# Thresholds for Away + Winter mode.
+# Thresholds for Away mode frost protection.
 # When frost risk is detected, the full Home mode system activates (price
 # schedule + all guards). When temperatures recover, it deactivates back to
 # fully OFF. Hysteresis prevents cycling: separate activate/deactivate thresholds.
