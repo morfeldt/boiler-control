@@ -7,14 +7,14 @@ set per quarter-hour, not per hour, since 2025-10-01).
 
 Built for a vacation/weekend home: visited roughly once a month, boiler
 otherwise left on frost-guard. The goal is to shift the immersion
-heater's runtime toward cheap price periods while guaranteeing the boiler
-water temperature never drops too low, and to never freeze the house if
-anything in the chain fails.
+heater's runtime toward cheap price periods while protecting the monthly
+peak tariff (effektavgift), ensuring the boiler never drops too cold,
+and never freezing the house if anything in the chain fails.
 
 Occupancy is set via a virtual switch in Apple Home (Homebridge +
-homebridge-cmdswitch2). When away in summer the boiler is fully off.
-When away in winter the boiler is off unless frost risk is detected,
-at which point the full price-optimised home mode activates automatically.
+homebridge-cmdswitch2). When away the boiler is fully off. When away
+in winter, if frost risk is detected, the full price-optimised home mode
+activates automatically.
 
 ---
 
@@ -42,14 +42,17 @@ G3 Plus 1 enclosure. Power must be off when installing it.
 
 ```
 boiler/
-├── config.example.py    ← Template – copy to config.py and fill in your values
-├── config.py            ← Your actual settings (gitignored, never commit this)
+├── config.py            ← Tunable settings — tracked in git, safe to commit
+├── local.py             ← Site-specific values (IPs, keys, coordinates) — gitignored, stays on Pi
+├── local.example.py     ← Template for local.py
 ├── boiler_control.py    ← Main Pi script
 ├── shelly_watchdog.js   ← Watchdog script to install on the Shelly G3 Plus 1
 ├── heartbeat.php        ← Upload to your web server (receives Pi pings)
 ├── watchdog.php         ← Upload to your web server (run via cPanel cron)
-├── boiler_state.json    ← Created automatically (persisted state: temps, season)
-├── schedule.csv         ← Today's on/off plan, overwritten every 15 min
+├── boiler_state.json       ← Created automatically (persisted state: temps, actuals, monthly peak)
+├── slow_reheat_duty.txt    ← Created by --increment-duty; absent = use config default
+├── force_emergency.txt     ← Created by --fast-heat; auto-deleted when boiler is warm
+├── schedule.csv            ← Today's on/off plan, overwritten every 15 min
 └── boiler.log           ← Log of every decision
 ```
 
@@ -71,96 +74,49 @@ sudo apt update && sudo apt upgrade -y
 sudo pip3 install requests --break-system-packages
 ```
 
-### 3. Copy the files
+### 3. Clone the repo and create local.py
 
 ```bash
-sudo cp config.example.py boiler_control.py /home/boiler/boiler/
-sudo cp config.example.py /home/boiler/boiler/config.py
-sudo chown -R boiler:boiler /home/boiler/boiler
+cd /home/boiler
+sudo -u boiler git clone https://github.com/YOUR_USERNAME/boiler-control.git boiler
+cd boiler
+sudo -u boiler cp local.example.py local.py
 ```
 
-### 4. Configure
+Open `local.py` and fill in your site-specific values:
 
-Open `/home/boiler/boiler/config.py` and fill in your values.
-
-**Essential settings:**
 ```python
-BOILER_SHELLY_IP = "192.168.1.XX"  # IP of the Shelly G3 Plus 1 (also hosts the Add-on)
-PRICE_ZONE       = "SE3"            # SE1, SE2, SE3, or SE4
-
-OFF_QUARTERS_TARGET = 64            # Target 15-min periods/day to turn off (64 ≈ 16h)
-```
-
-**DS18B20 sensor indices** (as they appear on the Shelly Add-on):
-```python
-DS18B20_INDOOR_INDEX = 100   # Indoor air temperature
-DS18B20_BOILER_INDEX = 101   # Boiler water temperature
-DS18B20_FEED_INDEX   = 102   # Radiator feed temperature
-```
-
-**Boiler sensor calibration** — surface-mounted sensors read lower than
-actual water temperature. Measure the gap against a reference thermometer
-and set the offset accordingly:
-```python
-DS18B20_BOILER_OFFSET = 5.0  # °C added to raw boiler sensor reading
-```
-
-**Season inference** — the script infers heating season from the corrected
-boiler temperature and applies a different minimum temperature threshold
-for each season. The season only flips after 8 consecutive readings
-pointing the other way, preventing momentary dips from triggering a switch.
-You can override it manually if needed:
-```python
-SEASON_OVERRIDE              = None    # None (auto), "summer", or "winter"
-SEASON_INFERENCE_THRESHOLD_C = 65.0   # Corrected boiler temp above which = winter
-BOILER_MIN_TEMP_SUMMER_C     = 55.0   # Boiler forced ON below this in summer
-BOILER_MIN_TEMP_WINTER_C     = 68.0   # Boiler forced ON below this in winter
-```
-
-**Occupancy and weather** — set the coordinates for the property
-(used by the Open-Meteo API for outside temperature in Away+Winter mode)
-and tune the frost protection thresholds:
-```python
-OCCUPANCY_FILE = "/home/boiler/boiler/occupancy.txt"  # written by Homebridge switch
-
-WEATHER_LAT = 0.0000   # property latitude
-WEATHER_LON = 0.0000   # property longitude
-
-# Away + Winter frost protection thresholds (hysteresis)
-# Activate full home mode when either drops below the activate threshold.
-# Deactivate only when both recover above the deactivate threshold.
-AWAY_WINTER_ACTIVATE_INDOOR_C    = 12.0
-AWAY_WINTER_DEACTIVATE_INDOOR_C  = 16.0
-AWAY_WINTER_ACTIVATE_OUTSIDE_C   = 5.0
-AWAY_WINTER_DEACTIVATE_OUTSIDE_C = 8.0
-```
-
-**Watchdog heartbeats:**
-```python
+BOILER_SHELLY_IP       = "192.168.1.XX"   # IP of the Shelly G3 Plus 1
+HT_SHELLY_IP           = "192.168.1.YY"   # IP of the Shelly H&T
+HT_SHELLY_GEN          = 1                # 1 = H&T original, 2 = Plus H&T
+CLOUD_AUTH_KEY         = "your-auth-key"  # Shelly app → User Settings → Authorization cloud key
+CLOUD_SERVER           = "shelly-XX-eu.shelly.cloud"
+HT_DEVICE_ID           = "XXXXXX"         # Last 6 hex chars of H&T MAC, lowercase
 SERVER_HEARTBEAT_URL   = "https://yoursite.com/boiler/heartbeat.php"
-SERVER_HEARTBEAT_TOKEN = "REPLACE_WITH_YOUR_SECRET_TOKEN"  # must match heartbeat.php
+SERVER_HEARTBEAT_TOKEN = "your-secret-token"
+WEATHER_LAT            = 0.0000           # Property latitude
+WEATHER_LON            = 0.0000           # Property longitude
 ```
 
-**Shelly H&T fallback** (used if DS18B20 indoor sensor is unavailable):
-
-The original Shelly H&T sleeps between reports to save battery, making
-local HTTP polling unreliable. The script falls back to Shelly Cloud,
-which always holds the last reported value regardless of sleep state.
-
-Get your credentials via the Shelly app → User Settings →
-Authorization cloud key, then fill in:
-```python
-HT_SHELLY_IP   = "192.168.1.YY"
-CLOUD_AUTH_KEY = "your-auth-key-here"
-CLOUD_SERVER   = "shelly-XX-eu.shelly.cloud"
-HT_DEVICE_ID   = "XXXXXX"              # Last 6 hex chars of H&T MAC, lowercase
-```
-
-⚠️ **Treat `CLOUD_AUTH_KEY` like a password.** Never commit `config.py`
-with real values. Only `config.example.py` belongs in the repo.
+⚠️ **`local.py` is gitignored and must never be committed.** It contains
+credentials and your property's location.
 
 **Tip:** Set static IP addresses for all Shelly devices in your router's
 DHCP settings (MAC reservation) to prevent IPs changing on reboot.
+
+### 4. Tune settings (optional)
+
+All tunable settings live in `config.py`, which is tracked in git with
+sensible defaults. Edit it directly if you need to change thresholds —
+for example `OFF_QUARTERS_TARGET`, `SLOW_REHEAT_TRIGGER_C`, or the
+frost protection thresholds. Changes are picked up on the next
+`git pull` on the Pi.
+
+**Boiler sensor calibration** — surface-mounted sensors read lower than
+actual water temperature. Measure the gap against a reference thermometer:
+```python
+DS18B20_BOILER_OFFSET = 0.0  # °C added to raw DS18B20 boiler reading
+```
 
 ### 5. Test manually
 
@@ -171,9 +127,10 @@ LANG=en_US.UTF-8 tail -3 /home/boiler/boiler/boiler.log
 
 Expected log output:
 ```
-2026-01-15 03:00  Quarter 03:00 | Occupancy: home | Indoor: 18.5°C (read 03:00) | Outside: n/a | Boiler: 72.3°C | Feed: 45.1°C | Season: winter | 0.312 SEK/kWh | Boiler: OFF (scheduled off (expensive period))
-2026-01-15 08:00  Quarter 08:00 | Occupancy: home | Indoor: 18.2°C (read 07:55) | Outside: n/a | Boiler: 65.8°C | Feed: 38.2°C | Season: winter | 1.854 SEK/kWh | Boiler: ON  (boiler temp guard (65.8°C < 68.0°C))
-2026-01-15 02:00  Quarter 02:00 | Occupancy: away | Indoor: 11.2°C (read 01:55) | Outside: 3.1°C | Boiler: 52.3°C | Feed: 28.1°C | Season: winter | 0.218 SEK/kWh | Boiler: OFF (away+winter frost protection active — scheduled off (expensive period))
+2026-01-15 03:00  Quarter 03:00 | Occupancy: home | Indoor: 18.5°C (read 03:00) | Outside: n/a | Boiler: 72.3°C | Feed: 45.1°C | 0.312 SEK/kWh | Boiler: OFF (scheduled off (expensive period))
+2026-01-15 08:00  Quarter 08:00 [PEAK] | Occupancy: home | Indoor: 18.2°C (read 07:55) | Outside: n/a | Boiler: 62.1°C | Feed: 38.2°C | 1.854 SEK/kWh | Boiler: OFF (peak window — holding off (boiler 62.1°C ≥ 40.0°C))
+2026-01-15 02:00  Quarter 02:00 | Occupancy: home | Indoor: 17.4°C (read 01:55) | Outside: n/a | Boiler: 58.3°C | Feed: 30.2°C | 0.218 SEK/kWh | Boiler: ON [slow] (slow reheat (58.3°C < 65.0°C))
+2026-01-15 04:00  Quarter 04:00 | Occupancy: away | Indoor: 11.2°C (read 03:55) | Outside: 3.1°C | Boiler: 52.3°C | Feed: 28.1°C | 0.310 SEK/kWh | Boiler: OFF (away frost protection active — scheduled off (expensive period))
 ```
 
 ### 6. Add to cron
@@ -279,11 +236,35 @@ add to the `platforms` array):
 ```
 
 In Apple Home: switch **ON** = Home (normal operation),
-switch **OFF** = Away (reduced/off mode).
-
-The occupancy file persists across Pi reboots. If the file is missing,
+switch **OFF** = Away (reduced/off mode). If the file is missing,
 the script defaults to "home" — so a Pi crash never accidentally leaves
 the boiler in away mode.
+
+---
+
+## Deploying updates
+
+`config.py` and `boiler_control.py` are both tracked in git. To deploy
+any change — code fix, threshold tweak, new feature — just pull on the Pi:
+
+```bash
+sudo -u boiler git -C /home/boiler/boiler pull
+```
+
+`local.py` is gitignored and is never touched by a pull. No SCP, no
+chmod/chown, no file juggling.
+
+To migrate from the old single-file layout (gitignored `config.py`):
+
+```bash
+# On the Pi
+cd /home/boiler/boiler
+sudo -u boiler cp local.example.py local.py
+# Copy your IPs, keys and coordinates from the old config.py into local.py
+sudo -u boiler nano local.py
+# Then pull the new repo structure
+sudo -u boiler git pull
+```
 
 ---
 
@@ -295,14 +276,12 @@ Occupancy is set via a virtual switch in Apple Home (switch ON = Home,
 switch OFF = Away). The state is written to `occupancy.txt` by the
 Homebridge plugin and read on every Pi run.
 
-| Mode | Season | Behaviour |
-|---|---|---|
-| Home | Summer | Price schedule + boiler temp guard + frost guard |
-| Home | Winter | Price schedule + boiler temp guard + frost guard |
-| Away | Summer | Boiler **fully OFF** — no schedule, no guards |
-| Away | Winter | Boiler **fully OFF** unless frost risk detected |
+| Mode | Behaviour |
+|---|---|
+| Home | Price schedule + peak guard + slow reheat + frost guard |
+| Away | Boiler **fully OFF** unless frost risk detected |
 
-**Away + Winter frost protection** uses hysteresis to avoid cycling.
+**Away mode frost protection** uses hysteresis to avoid cycling.
 Full Home mode activates when either condition is met:
 - Indoor temp drops below `AWAY_WINTER_ACTIVATE_INDOOR_C` (12°C), or
 - Outside temp drops below `AWAY_WINTER_ACTIVATE_OUTSIDE_C` (5°C) —
@@ -318,8 +297,12 @@ heating continues correctly across Pi reboots and power outages.
 
 Outside temperature is fetched from the
 [Open-Meteo API](https://open-meteo.com) (free, no API key required)
-using the property's coordinates. It is only fetched in Away+Winter
-mode — in all other modes `outside` shows as `n/a` in the log.
+using the property's coordinates. It is only fetched in Away mode —
+in Home mode `outside` shows as `n/a` in the log.
+
+Frost protection is driven purely by outdoor and indoor temperatures —
+in summer, outdoor temperatures are high enough that frost risk never
+triggers, so the boiler stays off automatically.
 
 ### Scheduling
 
@@ -330,25 +313,163 @@ Nordpool moved to quarter-hour resolution on 2025-10-01).
 The boiler is **ON by default**. The script turns off the most expensive
 quarters to reach `OFF_QUARTERS_TARGET` for the day, using a pure greedy
 algorithm (most expensive first) when the boiler temperature sensor is
-available. This produces the maximum savings while the boiler temp guard
-directly ensures hot water safety.
+available.
 
-### Boiler temperature guard
+### Slow reheat — protecting the monthly peak tariff
 
-The corrected boiler temperature (raw DS18B20 + `DS18B20_BOILER_OFFSET`)
-is checked every run. If it falls below the season's minimum threshold,
-the boiler is forced ON regardless of the price schedule. This replaces
-a time-based consecutive-off limit with a direct physical measurement,
-adapting automatically to actual heat demand rather than guessing.
+The CTC 1100 immersion heater draws 9 kW. Running it at full power into
+cold radiators (e.g. on arrival at the house) can create a sustained
+9 kW hourly average, directly impacting Degerfors Energi's
+effektavgift (50 kr/kW/month, worst hour) and högbelastningsavgift
+(+40 kr/kW/month, Nov–Mar weekday 07:00–19:00, worst hour). A single bad
+hour can cost 400+ kr in monthly tariff alone.
 
-### Season inference
+Instead of a single on/off threshold, the boiler operates in three tiers:
 
-Summer and winter modes apply different boiler minimum temperature
-thresholds. The season is inferred from the corrected boiler temperature
-(above `SEASON_INFERENCE_THRESHOLD_C` = winter, below = summer) and
-persisted in the state file. It only flips after
-`SEASON_CHANGE_READINGS` consecutive readings suggesting the other
-season, preventing a temporary dip from triggering an incorrect switch.
+| Boiler temp | Mode | Grid draw |
+|---|---|---|
+| ≥ 65°C (`SLOW_REHEAT_TRIGGER_C`) | Normal — follow price schedule | Full 9 kW while ON |
+| 50–65°C | **Slow reheat** — price-scaled duty, always on in home mode | 0.9–3 kW average (10–33% duty) |
+| < 50°C (`SLOW_REHEAT_MIN_C`) | **Emergency** — full power for the quarter | Full 9 kW |
+
+**Slow reheat in home mode** fires every quarter regardless of the price
+schedule, but the duty scales with this quarter's price rank among all
+96 quarters of the day: the cheapest quarter gets `SLOW_REHEAT_DUTY`
+(max, e.g. 33%), the most expensive gets `SLOW_REHEAT_MIN_DUTY` (min,
+e.g. 10%), and intermediate quarters are linearly interpolated by rank.
+Rank-based scaling means price outliers don't compress the useful range —
+a median-priced quarter always gets roughly half the range regardless of
+how extreme the cheapest or most expensive quarter is.
+
+This keeps the boiler stable during occupied stays without requiring 9 kW
+emergency spikes at expensive prices: a 10% draw (~0.9 kW average) during
+an expensive quarter costs far less than a full 9 kW spike a few quarters
+later once the boiler dips below `SLOW_REHEAT_MIN_C`.
+
+**Slow reheat in away mode** (frost protection) keeps the original
+scheduled-off gate — overnight cheap slots are sufficient when nobody is
+home using hot water.
+
+**Slow reheat** uses the Shelly's native `toggle_after` parameter:
+the relay turns ON, the Pi sets a timer for `duty × 900` seconds
+(e.g. 0.33 × 900 = 297 s ≈ 5 min), and the Shelly cuts power
+automatically — without changing the Pi's 15-minute poll interval.
+
+The log tag shows the actual duty used each quarter:
+```
+Quarter 14:30 | ... | Boiler: ON [slow 18%] (slow reheat (62.1°C < 65.0°C, 18% duty))
+Quarter 01:15 | ... | Boiler: ON [slow 31%] (slow reheat (58.3°C < 65.0°C, 31% duty))
+```
+
+**Emergency mode** (full quarter at 9 kW) is a genuine safety measure
+for a very cold boiler during normal home use, not a peak-tariff risk,
+because the boiler is below 50°C only in unusual conditions.
+
+### Peak guard (Nov–Mar weekday 07:00–19:00)
+
+Degerfors Energi's effekttariff has two components:
+- **Effektavgift** — 50 kr/kW/month, based on the single worst hourly
+  average across the entire month.
+- **Högbelastningsavgift** — 40 kr/kW/month (Nov–Mar only), based on
+  the single worst hourly average during weekday 07:00–19:00.
+
+During the peak window, the script suppresses all heating unless the
+boiler drops below `PEAK_GUARD_TEMP_C` (40°C). Off-peak slow reheat
+(typically overnight in cheap price slots) pre-heats the boiler to ≥65°C,
+building a thermal buffer so it can coast through the morning peak without
+the element running at all.
+
+The log marks peak-window runs with a `[PEAK]` tag:
+```
+Quarter 08:15 [PEAK] | ... | Boiler: OFF (peak window — holding off (boiler 63.5°C ≥ 40.0°C))
+```
+
+### Slow-reheat duty override
+
+The slow-reheat duty (fraction of each 15-minute slot the element runs)
+can be raised from Apple Home without touching `config.py`. This is useful
+when you want faster heating — e.g. arriving sooner than expected.
+
+Each tap of the Apple Home switch steps through the presets in
+`SLOW_REHEAT_DUTY_STEPS` (e.g. 33% → 50% → 67% → 100% → 50% → …). The
+active duty persists in `slow_reheat_duty.txt` until the end of the billing
+month, when the script auto-deletes the file and reverts to `SLOW_REHEAT_DUTY`
+from `config.py`.
+
+**Monthly peak tracking and auto-unlock:** Every run, the script records the
+estimated grid draw for that quarter (0 / duty×9 / 9 kW) and computes the
+worst clock-hour average for the current billing month. This is the `Peak`
+field shown in the log and schedule file. If the monthly peak already exceeds
+what slow reheat at the current duty would draw, limiting the duty no longer
+protects the tariff — the script automatically raises the effective duty to
+match, so you get faster heating for free.
+
+**Add to Homebridge `config.json`** (in the `switches` array alongside the
+occupancy switch):
+```json
+{
+    "name": "Stuga - Uppvärmning",
+    "on_cmd":    "python3 /home/boiler/boiler/boiler_control.py --increment-duty",
+    "off_cmd":   "python3 /home/boiler/boiler/boiler_control.py --reset-duty",
+    "state_cmd": "test -f /home/boiler/boiler/slow_reheat_duty.txt",
+    "polling": false,
+    "timeout": 5
+}
+```
+
+- Switch **ON** (tap while off) — increments duty to next step; the switch flips
+  back to off after a moment since `state_cmd` reflects the file's presence, not
+  the duty level. Tap again to step further.
+- Switch **OFF** (tap while on) — resets to `SLOW_REHEAT_DUTY` from config.
+
+To check the current duty from the Pi:
+```bash
+cat /home/boiler/boiler/slow_reheat_duty.txt   # active override, or "no such file" = config default
+```
+
+### Away→home transition warm-up
+
+The occupancy switch in Apple Home is always flipped a day ahead of
+arrival. On that transition, the boiler may be cold from Away mode, but
+there is no urgent demand — the house will be entered ~24 hours later.
+
+Normally a boiler below 50°C would trigger emergency full-power mode
+(9 kW for 15 min). Instead, when the script detects an away→home
+transition, it sets a flag in the state file that suppresses emergency
+mode. The boiler slow-reheats the whole way up from cold during cheap
+overnight price slots at 33% duty (~3 kW average).
+
+The flag is cleared once the boiler reaches 50°C
+(`SLOW_REHEAT_MIN_C`), at which point normal slow reheat takes over
+automatically for the 50→65°C range.
+
+This avoids a 9 kW spike on arrival preparation while still delivering
+a warm boiler by the time you arrive.
+
+**If you flip the switch too late** and need heat fast, tap the
+"Stuga - Snabb uppvärmning" switch in Apple Home. This creates
+`force_emergency.txt`, which clears the transition flag and allows
+emergency full-power mode on the next Pi run. The file is auto-deleted
+once the boiler reaches `SLOW_REHEAT_MIN_C`, and the switch reflects
+the file's presence via `state_cmd`.
+
+**Add to Homebridge `config.json`** (in the `switches` array alongside
+the other switches):
+```json
+{
+    "name": "Stuga - Snabb uppvärmning",
+    "on_cmd":    "python3 /home/boiler/boiler/boiler_control.py --fast-heat",
+    "off_cmd":   "python3 /home/boiler/boiler/boiler_control.py --clear-fast-heat",
+    "state_cmd": "test -f /home/boiler/boiler/force_emergency.txt",
+    "polling": false,
+    "timeout": 5
+}
+```
+
+- Switch **ON** — enables fast heat; emergency full-power allowed immediately.
+- Switch **OFF** — clears the override; transition slow-reheat resumes.
+- Auto-clears — the script deletes `force_emergency.txt` once the boiler
+  is warm, so you don't need to manually turn it off.
 
 ### Indoor temperature and frost guard
 
@@ -387,13 +508,13 @@ local Shelly watchdog handles the actual boiler fail-safe.
 
 ```
 # Schedule generated: 2026-01-15 09:00:01
-# Occupancy: home | Season: winter | Outside: n/a | Boiler min: 68.0°C | boiler temp guard active
+# Occupancy: home | Outside: n/a | slow reheat <65°C / emergency <50°C
 # Off quarters: 64/96 (target 64)
 # ##...####...
 time,price_sek_per_kwh,scheduled,actual
 00:00,0.3120,ON,ON
 00:30,0.1540,OFF,OFF
-08:00,1.8540,ON,ON        ← boiler temp guard forced ON despite schedule
+08:00,1.8540,ON,ON        ← price schedule says ON; peak guard may still suppress
 ...
 14:00,0.2100,OFF,         ← future quarter, actual not yet known
 ```
@@ -414,15 +535,14 @@ The system is designed to never leave the house unprotected:
 
 | Situation | What happens |
 |---|---|
-| Spot price API down | Boiler ON (except Away+Summer: stays OFF) |
+| Spot price API down | Boiler ON in Home mode; OFF in Away mode |
 | DS18B20 indoor sensor unavailable | Falls back to H&T chain |
 | H&T asleep (normal) | Tries Shelly Cloud → uses last known cloud value |
 | H&T asleep AND Cloud down | Uses last saved local value (if <4h old) |
-| All indoor temp sources too old | Boiler ON (except Away+Summer: stays OFF) |
+| All indoor temp sources too old | Boiler ON (Home); frost protection activates (Away) |
 | DS18B20 boiler sensor unavailable | Falls back to `MAX_CONSEC_OFF_QUARTERS` constraint |
-| Away+Summer, any error | Boiler stays OFF (no frost risk in summer) |
-| Away+Winter, indoor temp unavailable | Frost protection activated as fail-safe → Boiler ON |
-| Away+Winter, outside temp unavailable | Indoor temp alone determines frost risk |
+| Away mode, indoor temp unavailable | Frost protection activated as fail-safe → Boiler ON |
+| Away mode, outside temp unavailable | Indoor temp alone determines frost risk |
 | Unexpected program error | Boiler ON |
 | Pi crashes while boiler is OFF | Shelly watchdog forces ON after 45 min |
 | Pi crashes while boiler is ON | Boiler stays ON (no action needed) |
@@ -439,38 +559,52 @@ The system is designed to never leave the house unprotected:
 Toggle the "Stuga - Hemma" switch in Apple Home (or ask Siri). ON =
 Home, OFF = Away. The change takes effect on the next 15-minute Pi run.
 
-**What happens in Away+Winter if it gets cold?**
+**What happens in Away mode if it gets cold?**
 When indoor temp drops below 12°C or outside temp drops below 5°C,
 the full Home mode system activates automatically — price schedule,
-boiler temp guard, and frost guard all run as normal. It deactivates
+peak guard, slow reheat, and frost guard all run as normal. It deactivates
 again only when indoor recovers above 16°C AND outside above 8°C.
 The activation state persists across reboots.
 
-**Why is Outside showing n/a in the log?**
-Outside temperature is only fetched in Away+Winter mode, since that's
-the only mode that uses it. In all other modes it's skipped to avoid
-unnecessary API calls.
+**How do I get faster heating from Apple Home?**
+Tap the "Stuga - Uppvärmning" switch in Apple Home. Each tap steps the
+slow-reheat duty up (e.g. 33% → 50% → 67% → 100%), letting the element run
+longer each quarter. Tap OFF to reset to the config default immediately. The
+override resets automatically at the start of each billing month.
+
+If the monthly peak power is already high (e.g. from earlier full-power
+periods), the script may have already auto-unlocked a higher duty without
+you needing to press anything — check `Peak:` in the log.
 
 **How do I adjust how long the boiler stays on?**
 Change `OFF_QUARTERS_TARGET` in `config.py`. Each unit is 15 minutes;
 64 ≈ 16h off per day. During cold periods, lower this value to keep
 the boiler on more.
 
-**How do I adjust the hot water minimum temperature?**
-Change `BOILER_MIN_TEMP_SUMMER_C` or `BOILER_MIN_TEMP_WINTER_C`.
-If the boiler temp sensor reads consistently lower than actual water
-temperature, adjust `DS18B20_BOILER_OFFSET` first.
+**I flipped the arrive switch too late and the house is cold — how do I get heat fast?**
+Tap the "Stuga - Snabb uppvärmning" switch in Apple Home. It creates an
+override file that clears the transition flag and lets emergency full-power
+(9 kW) run on the next Pi run (within 15 min). The switch turns itself off
+automatically once the boiler reaches 50°C (`SLOW_REHEAT_MIN_C`).
 
-**How do I force a specific season?**
-Set `SEASON_OVERRIDE = "summer"` or `SEASON_OVERRIDE = "winter"` in
-`config.py`. Takes effect on the next 15-minute run. Set back to `None`
-to resume automatic inference.
+**How do I adjust the slow reheat thresholds?**
+- `SLOW_REHEAT_TRIGGER_C` — raise to start slow-reheating at a higher
+  temperature; lower to let the boiler coast further before intervening.
+- `SLOW_REHEAT_MIN_C` — raise if you want emergency mode to kick in
+  sooner; lower to trust slow reheat further down.
+- `SLOW_REHEAT_DUTY` — the max duty (used for the cheapest quarters and
+  as the monthly reset value); raise to heat faster during cheap periods.
+- `SLOW_REHEAT_MIN_DUTY` — the min duty (used for the most expensive
+  quarters); raise to heat more aggressively even at peak prices; lower
+  to prioritise tariff protection over boiler stability.
+- `DS18B20_BOILER_OFFSET` — adjust if the sensor reads consistently
+  lower than actual water temperature (measure against a thermometer).
 
 **What if the boiler temperature sensor fails?**
 The script falls back to the `MAX_CONSEC_OFF_QUARTERS` constraint —
 the same time-based approach used before the sensor was added. A warning
-is logged and the season defaults to the last known value (or "winter"
-if unknown, which applies the safer higher threshold).
+is logged. Slow reheat and peak guard require the boiler sensor; without
+it, the script falls back to simpler on/off scheduling.
 
 **I got a watchdog email but the boiler seems fine — what happened?**
 Most likely a brief internet outage at the house. The local Shelly
