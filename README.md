@@ -445,20 +445,28 @@ config from step 10):
     "name": "CMD Switch",
     "switches": [
         {
-            "name": "Stuga - Hemma",
+            "name": "Värmesystem (av = frostvakt)",
             "on_cmd":    "echo home > /home/boiler/boiler/occupancy.txt",
             "off_cmd":   "echo away > /home/boiler/boiler/occupancy.txt",
             "state_cmd": "grep -q home /home/boiler/boiler/occupancy.txt",
             "polling": false,
-            "timeout": 5
+            "interval": 60,
+            "timeout": 5,
+            "manufacturer": "CTC",
+            "model": "1100 with Boiler Control (GitHub)",
+            "serial": "123456"
         },
         {
-            "name": "Stuga - Värmeboost",
+            "name": "Värmeboost",
             "on_cmd":    "python3 /home/boiler/boiler/boiler_control.py --boost && python3 /home/boiler/boiler/boiler_control.py",
             "off_cmd":   "python3 /home/boiler/boiler/boiler_control.py --clear-boost",
             "state_cmd": "test -f /home/boiler/boiler/force_emergency.txt || test -f /home/boiler/boiler/slow_reheat_duty.txt",
             "polling": false,
-            "timeout": 15
+            "interval": 60,
+            "timeout": 15,
+            "manufacturer": "CTC",
+            "model": "1100 with Boiler Control (GitHub)",
+            "serial": "123457"
         }
     ]
 }
