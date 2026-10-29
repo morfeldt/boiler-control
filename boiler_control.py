@@ -54,7 +54,8 @@ from config import (
     DS18B20_INDOOR_INDEX, DS18B20_BOILER_INDEX, DS18B20_FEED_INDEX,
     DS18B20_BOILER_OFFSET,
     SLOW_REHEAT_TRIGGER_C, SLOW_REHEAT_MIN_C, SLOW_REHEAT_DUTY, SLOW_REHEAT_DUTY_FILE,
-    SLOW_REHEAT_DUTY_STEPS, PEAK_GUARD_TEMP_C, SLOW_REHEAT_MIN_DUTY, FORCE_EMERGENCY_FILE,
+    SLOW_REHEAT_DUTY_STEPS, PEAK_GUARD_TEMP_C, SLOW_REHEAT_MIN_DUTY, BOOST_DURATION_HOURS,
+    FORCE_EMERGENCY_FILE,
     FROST_GUARD_C, MAX_TEMP_AGE_HOURS,
     OCCUPANCY_FILE,
     WEATHER_LAT, WEATHER_LON,
@@ -696,6 +697,75 @@ def disable_fast_heat() -> None:
         print("Fast heat override not active")
 
 
+# ── Heating boost (combined switch) ──────────────────────────────────────────
+
+def boost() -> None:
+    """
+    Combined heating boost, behaviour depends on current state:
+
+    During away→home transition (boiler cold from Away mode):
+      Clears the transition flag and activates emergency full-power mode
+      immediately. Auto-clears once the boiler reaches SLOW_REHEAT_MIN_C.
+
+    Otherwise:
+      Raises the duty ceiling to max for BOOST_DURATION_HOURS, then
+      auto-resets. The resulting monthly peak increase may raise the
+      auto-unlock duty for the rest of the billing period.
+
+    Usage: python3 boiler_control.py --boost
+    Homebridge on_cmd: python3 /home/boiler/boiler/boiler_control.py --boost
+    """
+    state = load_state()
+    if state.get("away_transition"):
+        Path(FORCE_EMERGENCY_FILE).parent.mkdir(parents=True, exist_ok=True)
+        Path(FORCE_EMERGENCY_FILE).touch()
+        state["away_transition"] = False
+        save_state(state)
+        print(
+            f"Boost: transition mode — emergency full-power until boiler ≥ {SLOW_REHEAT_MIN_C}°C"
+        )
+    else:
+        max_step = max(SLOW_REHEAT_DUTY_STEPS)
+        p = Path(SLOW_REHEAT_DUTY_FILE)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"{max_step:.4f}")
+        expiry = datetime.now().timestamp() + BOOST_DURATION_HOURS * 3600
+        state["duty_boost_expiry"] = expiry
+        save_state(state)
+        expiry_str = datetime.fromtimestamp(expiry).strftime("%H:%M")
+        print(
+            f"Boost: duty raised to {max_step:.0%} for {BOOST_DURATION_HOURS}h "
+            f"(auto-resets at {expiry_str})"
+        )
+
+
+def clear_boost() -> None:
+    """
+    Cancels any active boost — clears both the duty override and the
+    fast-heat override if present.
+
+    Usage: python3 boiler_control.py --clear-boost
+    Homebridge off_cmd: python3 /home/boiler/boiler/boiler_control.py --clear-boost
+    """
+    state = load_state()
+    cleared = []
+
+    p = Path(FORCE_EMERGENCY_FILE)
+    if p.exists():
+        p.unlink()
+        cleared.append("fast-heat")
+
+    p = Path(SLOW_REHEAT_DUTY_FILE)
+    if p.exists():
+        p.unlink()
+        cleared.append("duty boost")
+
+    state.pop("duty_boost_expiry", None)
+    save_state(state)
+
+    print(f"Boost cleared ({', '.join(cleared)})" if cleared else "No boost active")
+
+
 # ── Main logic ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -708,10 +778,20 @@ def main() -> None:
         state["actuals"]      = {}
         state["actuals_date"] = today_str
 
-    # 2. Compute effective slow-reheat duty for this quarter.
-    #    Checks the override file written by --increment-duty; auto-clears at month end.
-    #    Auto-unlock: if the monthly peak already exceeds what slow reheat would draw,
-    #    there is no tariff benefit to limiting further — raise duty to match the peak.
+    # 2. Expire duty boost if the two-hour window has passed, then compute effective duty.
+    if "duty_boost_expiry" in state:
+        if now.timestamp() >= state["duty_boost_expiry"]:
+            p = Path(SLOW_REHEAT_DUTY_FILE)
+            if p.exists():
+                try:
+                    p.unlink()
+                    logging.info(
+                        f"Duty boost expired — duty reset to config default {SLOW_REHEAT_DUTY:.0%}"
+                    )
+                except Exception as e:
+                    logging.warning(f"Could not clear duty boost file: {e}")
+            state.pop("duty_boost_expiry", None)
+
     effective_duty  = get_effective_duty(state, now)
     monthly_peak_kw = state.get("monthly_peak_kw", 0.0)
     auto_duty       = min(1.0, monthly_peak_kw / 9.0)
@@ -996,6 +1076,10 @@ if __name__ == "__main__":
         enable_fast_heat()
     elif len(sys.argv) == 2 and sys.argv[1] == "--clear-fast-heat":
         disable_fast_heat()
+    elif len(sys.argv) == 2 and sys.argv[1] == "--boost":
+        boost()
+    elif len(sys.argv) == 2 and sys.argv[1] == "--clear-boost":
+        clear_boost()
     else:
         try:
             main()

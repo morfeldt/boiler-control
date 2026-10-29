@@ -51,7 +51,7 @@ boiler/
 ├── watchdog.php         ← Upload to your web server (run via cPanel cron)
 ├── boiler_state.json       ← Created automatically (persisted state: temps, actuals, monthly peak)
 ├── slow_reheat_duty.txt    ← Created by --increment-duty; absent = use config default
-├── force_emergency.txt     ← Created by --fast-heat; auto-deleted when boiler is warm
+├── force_emergency.txt     ← Created by --boost (transition mode); auto-deleted when boiler is warm
 ├── schedule.csv            ← Today's on/off plan, overwritten every 15 min
 └── boiler.log           ← Log of every decision
 ```
@@ -404,29 +404,6 @@ what slow reheat at the current duty would draw, limiting the duty no longer
 protects the tariff — the script automatically raises the effective duty to
 match, so you get faster heating for free.
 
-**Add to Homebridge `config.json`** (in the `switches` array alongside the
-occupancy switch):
-```json
-{
-    "name": "Stuga - Uppvärmning",
-    "on_cmd":    "python3 /home/boiler/boiler/boiler_control.py --increment-duty",
-    "off_cmd":   "python3 /home/boiler/boiler/boiler_control.py --reset-duty",
-    "state_cmd": "test -f /home/boiler/boiler/slow_reheat_duty.txt",
-    "polling": false,
-    "timeout": 5
-}
-```
-
-- Switch **ON** (tap while off) — increments duty to next step; the switch flips
-  back to off after a moment since `state_cmd` reflects the file's presence, not
-  the duty level. Tap again to step further.
-- Switch **OFF** (tap while on) — resets to `SLOW_REHEAT_DUTY` from config.
-
-To check the current duty from the Pi:
-```bash
-cat /home/boiler/boiler/slow_reheat_duty.txt   # active override, or "no such file" = config default
-```
-
 ### Away→home transition warm-up
 
 The occupancy switch in Apple Home is always flipped a day ahead of
@@ -443,33 +420,58 @@ The flag is cleared once the boiler reaches 50°C
 (`SLOW_REHEAT_MIN_C`), at which point normal slow reheat takes over
 automatically for the 50→65°C range.
 
-This avoids a 9 kW spike on arrival preparation while still delivering
-a warm boiler by the time you arrive.
+### Heating boost switch ("Stuga - Värmeboost")
 
-**If you flip the switch too late** and need heat fast, tap the
-"Stuga - Snabb uppvärmning" switch in Apple Home. This creates
-`force_emergency.txt`, which clears the transition flag and allows
-emergency full-power mode on the next Pi run. The file is auto-deleted
-once the boiler reaches `SLOW_REHEAT_MIN_C`, and the switch reflects
-the file's presence via `state_cmd`.
+One combined switch handles both manual fast-heat (transition override)
+and duty boost (extra power during a stay).
 
-**Add to Homebridge `config.json`** (in the `switches` array alongside
-the other switches):
+**Behaviour depends on state when you tap ON:**
+
+| Situation | What `--boost` does |
+|-----------|---------------------|
+| Away→home transition in progress (boiler cold) | Clears transition flag → emergency full-power (9 kW) until boiler ≥ 50°C, then auto-clears |
+| Normal home mode | Raises slow-reheat duty to 100% for `BOOST_DURATION_HOURS` (default 2 h), then auto-resets |
+
+Tapping OFF always cancels any active boost immediately.
+
+**Note:** A duty boost raises the monthly peak — the auto-unlock logic
+will keep the effective duty elevated for the rest of the billing month.
+
+**Complete Homebridge `config.json`** (both switches; replaces the single-switch
+config from step 10):
 ```json
 {
-    "name": "Stuga - Snabb uppvärmning",
-    "on_cmd":    "python3 /home/boiler/boiler/boiler_control.py --fast-heat",
-    "off_cmd":   "python3 /home/boiler/boiler/boiler_control.py --clear-fast-heat",
-    "state_cmd": "test -f /home/boiler/boiler/force_emergency.txt",
-    "polling": false,
-    "timeout": 5
+    "platform": "cmdSwitch2",
+    "name": "CMD Switch",
+    "switches": [
+        {
+            "name": "Stuga - Hemma",
+            "on_cmd":    "echo home > /home/boiler/boiler/occupancy.txt",
+            "off_cmd":   "echo away > /home/boiler/boiler/occupancy.txt",
+            "state_cmd": "grep -q home /home/boiler/boiler/occupancy.txt",
+            "polling": false,
+            "timeout": 5
+        },
+        {
+            "name": "Stuga - Värmeboost",
+            "on_cmd":    "python3 /home/boiler/boiler/boiler_control.py --boost && python3 /home/boiler/boiler/boiler_control.py",
+            "off_cmd":   "python3 /home/boiler/boiler/boiler_control.py --clear-boost",
+            "state_cmd": "test -f /home/boiler/boiler/force_emergency.txt || test -f /home/boiler/boiler/slow_reheat_duty.txt",
+            "polling": false,
+            "timeout": 15
+        }
+    ]
 }
 ```
 
-- Switch **ON** — enables fast heat; emergency full-power allowed immediately.
-- Switch **OFF** — clears the override; transition slow-reheat resumes.
-- Auto-clears — the script deletes `force_emergency.txt` once the boiler
-  is warm, so you don't need to manually turn it off.
+- Switch **ON** — activates boost (context-aware, see table above).
+- Switch **OFF** — cancels any active boost immediately.
+- Switch stays ON while either `force_emergency.txt` or `slow_reheat_duty.txt` exists.
+
+To check the current duty from the Pi:
+```bash
+cat /home/boiler/boiler/slow_reheat_duty.txt   # active override, or "no such file" = config default
+```
 
 ### Indoor temperature and frost guard
 
@@ -582,10 +584,12 @@ Change `OFF_QUARTERS_TARGET` in `config.py`. Each unit is 15 minutes;
 the boiler on more.
 
 **I flipped the arrive switch too late and the house is cold — how do I get heat fast?**
-Tap the "Stuga - Snabb uppvärmning" switch in Apple Home. It creates an
-override file that clears the transition flag and lets emergency full-power
-(9 kW) run on the next Pi run (within 15 min). The switch turns itself off
-automatically once the boiler reaches 50°C (`SLOW_REHEAT_MIN_C`).
+Tap the "Stuga - Värmeboost" switch in Apple Home. While the script is in
+away→home transition mode, it acts as fast-heat: clears the transition flag
+and allows emergency full-power (9 kW) on the next Pi run (within 15 min).
+The switch turns itself off automatically once the boiler reaches 50°C
+(`SLOW_REHEAT_MIN_C`). Outside transition mode it instead raises the duty
+ceiling to 100% for 2 h — useful for getting extra heat during a stay.
 
 **How do I adjust the slow reheat thresholds?**
 - `SLOW_REHEAT_TRIGGER_C` — raise to start slow-reheating at a higher

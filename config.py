@@ -55,6 +55,7 @@ SLOW_REHEAT_DUTY       = 0.33         # Max duty (cheapest quarters); also the m
 SLOW_REHEAT_MIN_DUTY   = 0.10         # Min duty (most expensive quarters) in price-scaled slow reheat
 SLOW_REHEAT_DUTY_STEPS = [0.50, 0.67, 1.00]  # Steps cycled through by --increment-duty (Apple Home switch)
 SLOW_REHEAT_DUTY_FILE  = "/home/boiler/boiler/slow_reheat_duty.txt"  # Override file written by Homebridge
+BOOST_DURATION_HOURS   = 2            # How long the duty boost stays active before auto-resetting
 PEAK_GUARD_TEMP_C      = 40.0         # Nov–Mar weekday 07:00–19:00: only heat below this
 
 # --- Local watchdog and frost guard ---
