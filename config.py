@@ -22,7 +22,7 @@ DS18B20_FEED_INDEX   = 102   # Radiator feed temperature (logged only, not used 
 
 # Calibration offset for the boiler sensor (surface mount reads lower than water temp).
 # Increase or decrease this value until the corrected reading matches a reference thermometer.
-DS18B20_BOILER_OFFSET = 0.0  # °C added to raw DS18B20 boiler reading
+DS18B20_BOILER_OFFSET = 5.0  # °C added to raw DS18B20 boiler reading
 
 # --- Boiler temperature and slow reheat ---
 # The boiler is heated in three tiers depending on temperature:
@@ -50,13 +50,13 @@ DS18B20_BOILER_OFFSET = 0.0  # °C added to raw DS18B20 boiler reading
 # as a matter of course, so the boiler never sits in the 25–50°C growth
 # range for extended periods.
 SLOW_REHEAT_TRIGGER_C  = 65.0         # Below this, price-scaled slow reheat (home mode always)
-SLOW_REHEAT_MIN_C      = 50.0         # Below this, emergency full-power (except during away→home transition)
+SLOW_REHEAT_MIN_C      = 55.0         # Below this, emergency full-power (except during away→home transition)
 SLOW_REHEAT_DUTY       = 0.33         # Max duty (cheapest quarters); also the monthly reset value
 SLOW_REHEAT_MIN_DUTY   = 0.10         # Min duty (most expensive quarters) in price-scaled slow reheat
 SLOW_REHEAT_DUTY_STEPS = [0.50, 0.67, 1.00]  # Steps cycled through by --increment-duty (Apple Home switch)
 SLOW_REHEAT_DUTY_FILE  = "/home/boiler/boiler/slow_reheat_duty.txt"  # Override file written by Homebridge
 BOOST_DURATION_HOURS   = 2            # How long the duty boost stays active before auto-resetting
-PEAK_GUARD_TEMP_C      = 40.0         # Nov–Mar weekday 07:00–19:00: only heat below this
+PEAK_GUARD_TEMP_C      = 50.0         # Nov–Mar weekday 07:00–19:00: only heat below this
 
 # --- Local watchdog and frost guard ---
 FROST_GUARD_C      = 6     # Always keep boiler ON when indoor temp is below this
