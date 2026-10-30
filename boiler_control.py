@@ -884,7 +884,8 @@ def main() -> None:
 
     # 8. Mode-based boiler decision
     boiler_on   = False
-    slow_reheat = False   # True → use set_boiler_slow_reheat() instead of set_boiler()
+    slow_reheat = False   # True → use set_boiler_slow_reheat() with price-scaled duty
+    emergency   = False   # True → full 9 kW regardless of duty cap
     reheat_duty = effective_duty  # overridden to slow_reheat_duty in home mode slow reheat
     reasons     = []
     peak        = is_peak_window(now)
@@ -930,6 +931,7 @@ def main() -> None:
             elif boiler_temp_available and corrected_boiler_temp < SLOW_REHEAT_MIN_C:
                 # Boiler very cold — emergency full power
                 boiler_on = True
+                emergency  = True
                 reasons.append(
                     f"boiler temp emergency "
                     f"({corrected_boiler_temp:.1f}°C < {SLOW_REHEAT_MIN_C}°C)"
@@ -1001,6 +1003,7 @@ def main() -> None:
             # Suppressed during away→home transition — no urgent demand since the
             # switch is always flipped a day ahead; slow reheat covers the warm-up.
             boiler_on = True
+            emergency  = True
             reasons.append(
                 f"boiler temp emergency "
                 f"({corrected_boiler_temp:.1f}°C < {SLOW_REHEAT_MIN_C}°C)"
@@ -1030,10 +1033,15 @@ def main() -> None:
             )
 
     # 9. Apply boiler state and record power draw for monthly peak tracking
-    power_kw        = (reheat_duty * 9.0) if (boiler_on and slow_reheat) else (9.0 if boiler_on else 0.0)
-    if slow_reheat:
+    if boiler_on and not slow_reheat and not emergency:
+        # Normal operation: duty-cap to protect monthly peak, same auto-unlock as slow reheat
+        power_kw = effective_duty * 9.0
+        set_boiler_slow_reheat(effective_duty)
+    elif slow_reheat:
+        power_kw = reheat_duty * 9.0
         set_boiler_slow_reheat(reheat_duty)
     else:
+        power_kw = 9.0 if boiler_on else 0.0
         set_boiler(boiler_on)
     monthly_peak_kw = record_power_draw(state, now, power_kw)
 
@@ -1053,17 +1061,18 @@ def main() -> None:
         f"{indoor_temp:.1f}°C (read {indoor_time.strftime('%H:%M')})"
         if indoor_fresh else "n/a (stale)"
     )
-    peak_tag      = " [PEAK]"                       if peak        else ""
-    reheat_tag    = f" [slow {reheat_duty:.0%}]"    if slow_reheat else ""
-    fast_heat_tag = " [FAST HEAT]"                  if fast_heat   else ""
+    peak_tag      = " [PEAK]"                          if peak        else ""
+    reheat_tag    = f" [slow {reheat_duty:.0%}]"       if slow_reheat else ""
+    normal_cap_tag = f" [{effective_duty:.0%}]"        if (boiler_on and not slow_reheat and not emergency and effective_duty < 1.0) else ""
+    fast_heat_tag = " [FAST HEAT]"                     if fast_heat   else ""
 
     logging.info(
-        f"Quarter {now.strftime('%H:%M')}{peak_tag}{fast_heat_tag} | "
+        f"Quarter {now.strftime('%H:%M')}{peak_tag}{fast_heat_tag}{normal_cap_tag}{reheat_tag} | "
         f"Occupancy: {occupancy} | "
         f"Indoor: {indoor_str} | Outside: {outside_str} | "
         f"Boiler: {boiler_str} | Feed: {feed_str} | "
         f"{price:.3f} SEK/kWh | Peak: {monthly_peak_kw:.1f} kW | "
-        f"Boiler: {'ON ' if boiler_on else 'OFF'}{reheat_tag} ({', '.join(reasons)})"
+        f"Boiler: {'ON ' if boiler_on else 'OFF'} ({', '.join(reasons)})"
     )
 
 
