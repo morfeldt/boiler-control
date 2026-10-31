@@ -1049,9 +1049,10 @@ def main() -> None:
             slow_reheat = True
             reheat_duty = slow_reheat_duty
             mode_label  = "transition warm-up" if away_transition else "slow reheat"
+            boost_tag   = " [BOOST]" if duty_boost_active else ""
             reasons.append(
-                f"{mode_label} ({corrected_boiler_temp:.1f}°C < {SLOW_REHEAT_TRIGGER_C}°C, "
-                f"{reheat_duty:.0%} duty)"
+                f"{mode_label}{boost_tag} {corrected_boiler_temp:.1f}°C < {SLOW_REHEAT_TRIGGER_C}°C, "
+                f"{reheat_duty:.0%} duty"
             )
 
         else:
