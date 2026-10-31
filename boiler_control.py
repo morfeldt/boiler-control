@@ -55,6 +55,7 @@ from config import (
     DS18B20_BOILER_OFFSET,
     SLOW_REHEAT_TRIGGER_C, SLOW_REHEAT_MIN_C, SLOW_REHEAT_DUTY, SLOW_REHEAT_DUTY_FILE,
     SLOW_REHEAT_DUTY_STEPS, PEAK_GUARD_TEMP_C, SLOW_REHEAT_MIN_DUTY, BOOST_DURATION_HOURS,
+    FEED_DUTY_MIN_C, FEED_DUTY_MAX_C,
     FORCE_EMERGENCY_FILE,
     FROST_GUARD_C, MAX_TEMP_AGE_HOURS,
     OCCUPANCY_FILE,
@@ -661,6 +662,24 @@ def price_scaled_duty(
     return max_duty - normalized * (max_duty - min_duty)
 
 
+def feed_scaled_min_duty(
+    feed_temp: float | None,
+    min_duty: float,
+    max_duty: float,
+) -> float:
+    """
+    Returns a minimum duty floor based on radiator feed temperature.
+    High feed temp means the house heating circuit is extracting heat quickly,
+    so the boiler needs more power to keep up regardless of price.
+    Linear interpolation between FEED_DUTY_MIN_C (→ min_duty) and FEED_DUTY_MAX_C (→ max_duty).
+    Falls back to min_duty if sensor unavailable.
+    """
+    if feed_temp is None:
+        return min_duty
+    normalized = max(0.0, min(1.0, (feed_temp - FEED_DUTY_MIN_C) / (FEED_DUTY_MAX_C - FEED_DUTY_MIN_C)))
+    return min_duty + normalized * (max_duty - min_duty)
+
+
 def enable_fast_heat() -> None:
     """
     Activates the fast-heat override: clears the away_transition flag and creates
@@ -870,10 +889,21 @@ def main() -> None:
         set_boiler(occupancy != "away")
         return
 
-    # Price-scaled slow-reheat duty for this quarter (home mode).
-    # Duty ranges from effective_duty (cheapest quarter) down to SLOW_REHEAT_MIN_DUTY
-    # (most expensive), scaled by price rank among all today's quarters.
-    slow_reheat_duty = price_scaled_duty(price, prices, SLOW_REHEAT_MIN_DUTY, effective_duty)
+    # Slow-reheat duty for this quarter (home mode).
+    # Boost active (and not in transition): user explicitly wants heat now — run at
+    # full effective_duty regardless of price. Otherwise price-scale between
+    # SLOW_REHEAT_MIN_DUTY and effective_duty, with a feed-temp demand floor.
+    duty_boost_active = (
+        "duty_boost_expiry" in state
+        and now.timestamp() < state["duty_boost_expiry"]
+        and not away_transition
+    )
+    if duty_boost_active:
+        slow_reheat_duty = effective_duty
+    else:
+        price_duty       = price_scaled_duty(price, prices, SLOW_REHEAT_MIN_DUTY, effective_duty)
+        feed_floor       = feed_scaled_min_duty(raw_feed, SLOW_REHEAT_MIN_DUTY, effective_duty)
+        slow_reheat_duty = max(price_duty, feed_floor)
 
     # Write heartbeats — Pi is alive and running normally
     write_shelly_heartbeat()
@@ -1028,9 +1058,12 @@ def main() -> None:
             # Boiler at or above comfort temperature (or sensor unavailable):
             # follow the price schedule normally.
             boiler_on = not scheduled_off
-            reasons.append(
-                "scheduled off (expensive period)" if scheduled_off else "normal operation"
-            )
+            if scheduled_off:
+                reasons.append("scheduled off (expensive period)")
+            elif effective_duty < 1.0:
+                reasons.append(f"normal operation ({effective_duty:.0%} duty)")
+            else:
+                reasons.append("normal operation")
 
     # 9. Apply boiler state and record power draw for monthly peak tracking
     if boiler_on and not slow_reheat and not emergency:
@@ -1061,13 +1094,11 @@ def main() -> None:
         f"{indoor_temp:.1f}°C (read {indoor_time.strftime('%H:%M')})"
         if indoor_fresh else "n/a (stale)"
     )
-    peak_tag      = " [PEAK]"                          if peak        else ""
-    reheat_tag    = f" [slow {reheat_duty:.0%}]"       if slow_reheat else ""
-    normal_cap_tag = f" [{effective_duty:.0%}]"        if (boiler_on and not slow_reheat and not emergency and effective_duty < 1.0) else ""
-    fast_heat_tag = " [FAST HEAT]"                     if fast_heat   else ""
+    peak_tag      = " [PEAK]"      if peak      else ""
+    fast_heat_tag = " [FAST HEAT]" if fast_heat else ""
 
     logging.info(
-        f"Quarter {now.strftime('%H:%M')}{peak_tag}{fast_heat_tag}{normal_cap_tag}{reheat_tag} | "
+        f"Quarter {now.strftime('%H:%M')}{peak_tag}{fast_heat_tag} | "
         f"Occupancy: {occupancy} | "
         f"Indoor: {indoor_str} | Outside: {outside_str} | "
         f"Boiler: {boiler_str} | Feed: {feed_str} | "
