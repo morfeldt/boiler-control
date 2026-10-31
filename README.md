@@ -459,7 +459,7 @@ config from step 10):
         {
             "name": "Värmeboost",
             "on_cmd":    "python3 /home/boiler/boiler/boiler_control.py --boost && python3 /home/boiler/boiler/boiler_control.py",
-            "off_cmd":   "python3 /home/boiler/boiler/boiler_control.py --clear-boost",
+            "off_cmd":   "python3 /home/boiler/boiler/boiler_control.py --clear-boost && python3 /home/boiler/boiler/boiler_control.py",
             "state_cmd": "test -f /home/boiler/boiler/force_emergency.txt || test -f /home/boiler/boiler/slow_reheat_duty.txt",
             "polling": false,
             "interval": 60,
@@ -473,7 +473,7 @@ config from step 10):
 ```
 
 - Switch **ON** — activates boost (context-aware, see table above).
-- Switch **OFF** — cancels any active boost immediately.
+- Switch **OFF** — cancels boost immediately and runs the control loop so the boiler responds straight away.
 - Switch stays ON while either `force_emergency.txt` or `slow_reheat_duty.txt` exists.
 
 To check the current duty from the Pi:

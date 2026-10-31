@@ -1057,9 +1057,13 @@ def main() -> None:
 
         else:
             # Boiler at or above comfort temperature (or sensor unavailable):
-            # follow the price schedule normally.
-            boiler_on = not scheduled_off
-            if scheduled_off:
+            # follow the price schedule normally. Boost overrides scheduled-off.
+            boiler_on = not scheduled_off or duty_boost_active
+            if duty_boost_active and scheduled_off:
+                reasons.append("boost override (scheduled off)")
+            elif duty_boost_active:
+                reasons.append(f"normal operation [BOOST] ({effective_duty:.0%} duty)")
+            elif scheduled_off:
                 reasons.append("scheduled off (expensive period)")
             elif effective_duty < 1.0:
                 reasons.append(f"normal operation ({effective_duty:.0%} duty)")
