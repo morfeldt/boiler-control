@@ -345,21 +345,21 @@ def get_indoor_temp(
 
 def get_outside_temp() -> float | None:
     """
-    Fetches current outside temperature from Open-Meteo (free, no API key).
+    Fetches current outside temperature from SMHI Point Forecast API (free, no API key).
     Used for Away mode frost protection and logged in Home mode for context.
     """
     try:
         r = requests.get(
-            "https://api.open-meteo.com/v1/forecast",
-            params={
-                "latitude":  WEATHER_LAT,
-                "longitude": WEATHER_LON,
-                "current":   "temperature_2m",
-            },
+            f"https://opendata-download-metfcst.smhi.se/api/category/pmp3g/version/2"
+            f"/geotype/point/lon/{WEATHER_LON}/lat/{WEATHER_LAT}/data.json",
             timeout=10,
         )
         r.raise_for_status()
-        return float(r.json()["current"]["temperature_2m"])
+        for entry in r.json()["timeSeries"]:
+            for param in entry["parameters"]:
+                if param["name"] == "t":
+                    return float(param["values"][0])
+        return None
     except Exception as e:
         logging.warning(f"Could not fetch outside temperature: {e}")
         return None
@@ -959,13 +959,22 @@ def main() -> None:
                 reasons.append(f"peak window — holding off ({temp_info})")
 
             elif boiler_temp_available and corrected_boiler_temp < SLOW_REHEAT_MIN_C:
-                # Boiler very cold — emergency full power
-                boiler_on = True
-                emergency  = True
-                reasons.append(
-                    f"boiler temp emergency "
-                    f"({corrected_boiler_temp:.1f}°C < {SLOW_REHEAT_MIN_C}°C)"
-                )
+                # Boiler very cold. If indoor is still safe, use slow reheat to avoid
+                # peak power waste. Only go full emergency if indoor is also critically low.
+                if indoor_temp < AWAY_WINTER_ACTIVATE_INDOOR_C:
+                    boiler_on = True
+                    emergency  = True
+                    reasons.append(
+                        f"boiler temp emergency "
+                        f"({corrected_boiler_temp:.1f}°C < {SLOW_REHEAT_MIN_C}°C)"
+                    )
+                else:
+                    boiler_on   = True
+                    slow_reheat = True
+                    reasons.append(
+                        f"slow reheat — indoor safe, boiler cold "
+                        f"({corrected_boiler_temp:.1f}°C < {SLOW_REHEAT_MIN_C}°C)"
+                    )
 
             elif boiler_temp_available and corrected_boiler_temp < SLOW_REHEAT_TRIGGER_C:
                 if not scheduled_off:
@@ -1099,11 +1108,8 @@ def main() -> None:
         f"{indoor_temp:.1f}°C (read {indoor_time.strftime('%H:%M')})"
         if indoor_fresh else "n/a (stale)"
     )
-    peak_tag      = " [PEAK]"      if peak      else ""
-    fast_heat_tag = " [FAST HEAT]" if fast_heat else ""
-
     logging.info(
-        f"Quarter {now.strftime('%H:%M')}{peak_tag}{fast_heat_tag} | "
+        f"Quarter {now.strftime('%H:%M')} | "
         f"Occupancy: {occupancy} | "
         f"Indoor: {indoor_str} | Outside: {outside_str} | "
         f"Boiler: {boiler_str} | Feed: {feed_str} | "
