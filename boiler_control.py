@@ -345,21 +345,22 @@ def get_indoor_temp(
 
 def get_outside_temp() -> float | None:
     """
-    Fetches current outside temperature from SMHI Point Forecast API (free, no API key).
+    Fetches current outside temperature from Open-Meteo API (free, no API key).
     Used for Away mode frost protection and logged in Home mode for context.
     """
     try:
         r = requests.get(
-            f"https://opendata-download-metfcst.smhi.se/api/category/pmp3g/version/2"
-            f"/geotype/point/lon/{WEATHER_LON}/lat/{WEATHER_LAT}/data.json",
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": WEATHER_LAT,
+                "longitude": WEATHER_LON,
+                "current": "temperature_2m",
+                "forecast_days": 1,
+            },
             timeout=10,
         )
         r.raise_for_status()
-        for entry in r.json()["timeSeries"]:
-            for param in entry["parameters"]:
-                if param["name"] == "t":
-                    return float(param["values"][0])
-        return None
+        return float(r.json()["current"]["temperature_2m"])
     except Exception as e:
         logging.warning(f"Could not fetch outside temperature: {e}")
         return None
