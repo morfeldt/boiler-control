@@ -639,6 +639,9 @@ def reset_duty() -> None:
         print(f"Slow-reheat duty override cleared — back to config default {SLOW_REHEAT_DUTY:.0%}")
     else:
         print(f"No override active — duty already at config default {SLOW_REHEAT_DUTY:.0%}")
+    state = load_state()
+    state.pop("duty_override_month", None)
+    save_state(state)
 
 
 def price_scaled_duty(
@@ -811,6 +814,7 @@ def main() -> None:
                 except Exception as e:
                     logging.warning(f"Could not clear duty boost file: {e}")
             state.pop("duty_boost_expiry", None)
+            state.pop("duty_override_month", None)
 
     effective_duty  = get_effective_duty(state, now)
     monthly_peak_kw = state.get("monthly_peak_kw", 0.0)
