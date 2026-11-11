@@ -54,7 +54,7 @@ from config import (
     DS18B20_INDOOR_INDEX, DS18B20_BOILER_INDEX, DS18B20_FEED_INDEX,
     DS18B20_BOILER_OFFSET,
     SLOW_REHEAT_TRIGGER_C, SLOW_REHEAT_MIN_C, SLOW_REHEAT_DUTY, SLOW_REHEAT_DUTY_FILE,
-    SLOW_REHEAT_DUTY_STEPS, PEAK_GUARD_TEMP_C, SLOW_REHEAT_MIN_DUTY, BOOST_DURATION_HOURS,
+    SLOW_REHEAT_DUTY_STEPS, SLOW_REHEAT_MIN_DUTY, BOOST_DURATION_HOURS,
     FEED_DUTY_MIN_C, FEED_DUTY_MAX_C,
     FORCE_EMERGENCY_FILE,
     FROST_GUARD_C, MAX_TEMP_AGE_HOURS,
@@ -170,6 +170,7 @@ def write_schedule_file(
     occupancy: str,
     outside_temp: float | None,
     monthly_peak_kw: float = 0.0,
+    peak_window_peak_kw: float = 0.0,
 ) -> None:
     """
     Writes today's full on/off plan to SCHEDULE_FILE, overwritten each run.
@@ -199,7 +200,7 @@ def write_schedule_file(
     lines = [
         f"# Schedule generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"# Occupancy: {occupancy} | Outside: {outside_str} | "
-        f"Peak: {monthly_peak_kw:.1f} kW | {sensor_note}{away_note}",
+        f"Peak: {monthly_peak_kw:.1f} kW | Win: {peak_window_peak_kw:.1f} kW | {sensor_note}{away_note}",
         f"# Off quarters: {off_count}/{len(chrono)} (target {OFF_QUARTERS_TARGET})",
         f"# {bar}",
         "time,price_sek_per_kwh,scheduled,actual",
@@ -584,22 +585,40 @@ def compute_monthly_peak_kw(log: dict) -> float:
     return max((total / 4 for total in hourly.values()), default=0.0)
 
 
-def record_power_draw(state: dict, now: datetime, power_kw: float) -> float:
+def record_power_draw(
+    state: dict, now: datetime, power_kw: float, in_peak_window: bool
+) -> tuple[float, float]:
     """
-    Logs this quarter's estimated grid draw and returns the updated monthly
-    peak kW (worst clock-hour average draw so far this billing month).
+    Logs this quarter's estimated grid draw. Returns (monthly_peak_kw, peak_window_peak_kw).
+
+    monthly_peak_kw    — worst clock-hour average across all hours this month
+                         (drives effektavgift, 50 kr/kW)
+    peak_window_peak_kw — worst clock-hour average during Nov–Mar weekday 07:00–19:00
+                         (drives högbelastningsavgift, 40 kr/kW); only updated in-window
     """
-    month_str = now.strftime("%Y-%m")
+    month_str   = now.strftime("%Y-%m")
+    quarter_key = now.strftime("%Y-%m-%dT%H:") + f"{(now.minute // 15) * 15:02d}"
+
+    # All-hours log (effektavgift)
     if state.get("monthly_kw_log_month") != month_str:
         state["monthly_kw_log"]       = {}
         state["monthly_kw_log_month"] = month_str
-
-    quarter_key = now.strftime("%Y-%m-%dT%H:") + f"{(now.minute // 15) * 15:02d}"
     state["monthly_kw_log"][quarter_key] = power_kw
+    monthly_peak_kw = compute_monthly_peak_kw(state["monthly_kw_log"])
+    state["monthly_peak_kw"] = monthly_peak_kw
 
-    peak_kw = compute_monthly_peak_kw(state["monthly_kw_log"])
-    state["monthly_peak_kw"] = peak_kw
-    return peak_kw
+    # Peak-window log (högbelastningsavgift — only written during the tariff window)
+    if in_peak_window:
+        if state.get("peak_window_kw_log_month") != month_str:
+            state["peak_window_kw_log"]       = {}
+            state["peak_window_kw_log_month"] = month_str
+        state["peak_window_kw_log"][quarter_key] = power_kw
+        peak_window_peak_kw = compute_monthly_peak_kw(state["peak_window_kw_log"])
+        state["peak_window_peak_kw"] = peak_window_peak_kw
+    else:
+        peak_window_peak_kw = state.get("peak_window_peak_kw", 0.0)
+
+    return monthly_peak_kw, peak_window_peak_kw
 
 
 # ── Duty override CLI helpers ─────────────────────────────────────────────────
@@ -822,6 +841,9 @@ def main() -> None:
     if auto_duty > effective_duty:
         effective_duty = auto_duty
 
+    peak_window_peak_kw        = state.get("peak_window_peak_kw", 0.0)
+    peak_window_effective_duty = max(SLOW_REHEAT_MIN_DUTY, min(1.0, peak_window_peak_kw / 9.0))
+
     # 3. Read all three DS18B20 sensors from Shelly Add-on
     raw_indoor = fetch_addon_temp(DS18B20_INDOOR_INDEX)
     raw_boiler = fetch_addon_temp(DS18B20_BOILER_INDEX)
@@ -952,14 +974,14 @@ def main() -> None:
                 reasons.append(f"frost guard ({indoor_temp:.1f}°C < {FROST_GUARD_C}°C)")
 
             elif peak and (
-                not boiler_temp_available or corrected_boiler_temp >= PEAK_GUARD_TEMP_C
+                not boiler_temp_available or corrected_boiler_temp >= SLOW_REHEAT_TRIGGER_C
             ):
                 # Peak tariff window and boiler not dangerously cold: hold off
                 boiler_on = False
                 temp_info = (
                     "no sensor"
                     if not boiler_temp_available
-                    else f"boiler {corrected_boiler_temp:.1f}°C ≥ {PEAK_GUARD_TEMP_C}°C"
+                    else f"boiler {corrected_boiler_temp:.1f}°C ≥ {SLOW_REHEAT_TRIGGER_C}°C"
                 )
                 reasons.append(f"peak window — holding off ({temp_info})")
 
@@ -1023,18 +1045,16 @@ def main() -> None:
             boiler_on = True
             reasons.append(f"frost guard ({indoor_temp:.1f}°C < {FROST_GUARD_C}°C)")
 
-        elif peak and (
-            not boiler_temp_available or corrected_boiler_temp >= PEAK_GUARD_TEMP_C
+        elif peak and not duty_boost_active and (
+            not boiler_temp_available or corrected_boiler_temp >= SLOW_REHEAT_TRIGGER_C
         ):
-            # Inside the peak tariff window and boiler not dangerously cold:
-            # hold off completely to protect the monthly effektavgift + högbelastningsavgift.
-            # Off-peak slow reheat during overnight cheap slots pre-heats the boiler
-            # so it can coast through the 07:00–19:00 window without this guard firing.
+            # Peak tariff window, no boost, and boiler warm enough to coast:
+            # hold off to protect effektavgift + högbelastningsavgift.
             boiler_on = False
             temp_info = (
                 "no sensor"
                 if not boiler_temp_available
-                else f"boiler {corrected_boiler_temp:.1f}°C ≥ {PEAK_GUARD_TEMP_C}°C"
+                else f"boiler {corrected_boiler_temp:.1f}°C ≥ {SLOW_REHEAT_TRIGGER_C}°C"
             )
             reasons.append(f"peak window — holding off ({temp_info})")
 
@@ -1053,12 +1073,31 @@ def main() -> None:
                 f"({corrected_boiler_temp:.1f}°C < {SLOW_REHEAT_MIN_C}°C)"
             )
 
+        elif peak and boiler_temp_available and corrected_boiler_temp < SLOW_REHEAT_TRIGGER_C:
+            # Peak window, boiler in the 55–65°C slow-reheat band.
+            # Use the same price-scaled algorithm as off-peak but cap duty at
+            # peak_window_effective_duty (derived from the highest peak-window hour
+            # recorded this month) so we never exceed the established
+            # högbelastningsavgift peak. Boost overrides the cap.
+            boiler_on   = True
+            slow_reheat = True
+            if duty_boost_active:
+                reheat_duty = effective_duty
+                boost_tag   = " [BOOST]"
+            else:
+                pw_price    = price_scaled_duty(price, prices, SLOW_REHEAT_MIN_DUTY, peak_window_effective_duty)
+                pw_feed     = feed_scaled_min_duty(raw_feed, SLOW_REHEAT_MIN_DUTY, peak_window_effective_duty)
+                reheat_duty = max(pw_price, pw_feed)
+                boost_tag   = ""
+            reasons.append(
+                f"peak window slow reheat{boost_tag} {corrected_boiler_temp:.1f}°C < {SLOW_REHEAT_TRIGGER_C}°C, "
+                f"{reheat_duty:.0%} duty"
+            )
+
         elif boiler_temp_available and corrected_boiler_temp < SLOW_REHEAT_TRIGGER_C:
-            # Slow-reheat whenever below the trigger, regardless of the price schedule.
-            # Duty scales with price rank: cheapest quarter → effective_duty (max),
-            # most expensive → SLOW_REHEAT_MIN_DUTY (min). A small draw at expensive
-            # prices costs less than a full 9 kW emergency spike a few quarters later.
-            # Peak window is already caught above; away mode keeps its scheduled_off gate.
+            # Off-peak slow-reheat: duty scales with price rank.
+            # A small draw at expensive prices costs less than a full 9 kW emergency
+            # spike a few quarters later.
             boiler_on   = True
             slow_reheat = True
             reheat_duty = slow_reheat_duty
@@ -1095,13 +1134,13 @@ def main() -> None:
     else:
         power_kw = 9.0 if boiler_on else 0.0
         set_boiler(boiler_on)
-    monthly_peak_kw = record_power_draw(state, now, power_kw)
+    monthly_peak_kw, peak_window_peak_kw = record_power_draw(state, now, power_kw, in_peak_window=peak)
 
     # 10. Record actual, write schedule file, save state
     state.setdefault("actuals", {})[current_key] = "ON" if boiler_on else "OFF"
     write_schedule_file(
         prices, off_keys, boiler_temp_available,
-        state["actuals"], occupancy, outside_temp, monthly_peak_kw,
+        state["actuals"], occupancy, outside_temp, monthly_peak_kw, peak_window_peak_kw,
     )
     save_state(state)
 
@@ -1110,15 +1149,16 @@ def main() -> None:
     feed_str    = f"{raw_feed:.1f}°C"              if raw_feed is not None   else "n/a"
     outside_str = f"{outside_temp:.1f}°C"          if outside_temp is not None else "n/a"
     indoor_str  = (
+        f"{indoor_temp:.1f}°C"
+        if indoor_fresh else
         f"{indoor_temp:.1f}°C (read {indoor_time.strftime('%H:%M')})"
-        if indoor_fresh else "n/a (stale)"
+        if indoor_temp is not None else "n/a (stale)"
     )
     logging.info(
-        f"Quarter {now.strftime('%H:%M')} | "
-        f"Occupancy: {occupancy} | "
+        f"Mode: {occupancy} | "
         f"Indoor: {indoor_str} | Outside: {outside_str} | "
         f"Boiler: {boiler_str} | Feed: {feed_str} | "
-        f"{price:.3f} SEK/kWh | Peak: {monthly_peak_kw:.1f} kW | "
+        f"{price:.3f} SEK/kWh | Peak: {monthly_peak_kw:.1f} kW | Winter peak: {peak_window_peak_kw:.1f} kW | "
         f"Boiler: {'ON ' if boiler_on else 'OFF'} ({', '.join(reasons)})"
     )
 

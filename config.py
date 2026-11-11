@@ -43,8 +43,9 @@ DS18B20_BOILER_OFFSET = 0.0  # °C added to raw DS18B20 boiler reading, offsetti
 #     Suppressed during away→home transition (switch is flipped a day ahead).
 #
 #   Peak window  (Nov–Mar, weekday, 07:00–19:00)
-#     No heating at all unless boiler drops below PEAK_GUARD_TEMP_C.
-#     Off-peak slow reheat builds the thermal buffer for this window.
+#     Hold off when boiler ≥ SLOW_REHEAT_TRIGGER_C (warm enough to coast).
+#     Below that, price-scaled slow reheat capped at the highest peak-window
+#     hour recorded this month (högbelastningsavgift budget). Boost overrides.
 #
 # Note on Legionella: SLOW_REHEAT_TRIGGER_C keeps the boiler above 55°C
 # as a matter of course, so the boiler never sits in the 25–50°C growth
@@ -58,7 +59,6 @@ FEED_DUTY_MIN_C        = 35.0   # Feed temp at or below this → price-scaled mi
 FEED_DUTY_MAX_C        = 45.0   # Feed temp at or above this → effective_duty floor applies
 SLOW_REHEAT_DUTY_FILE  = "/home/boiler/boiler/slow_reheat_duty.txt"  # Override file written by Homebridge
 BOOST_DURATION_HOURS   = 2            # How long the duty boost stays active before auto-resetting
-PEAK_GUARD_TEMP_C      = 50.0         # Nov–Mar weekday 07:00–19:00: only heat below this
 
 # --- Local watchdog and frost guard ---
 FROST_GUARD_C      = 6     # Always keep boiler ON when indoor temp is below this
