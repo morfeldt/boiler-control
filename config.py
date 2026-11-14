@@ -93,6 +93,7 @@ LOG_FILE             = "/home/boiler/boiler/boiler.log"
 SCHEDULE_FILE        = "/home/boiler/boiler/schedule.csv"
 FORCE_EMERGENCY_FILE = "/home/boiler/boiler/force_emergency.txt"  # Created by --fast-heat
 FURNACE_POWER_FILE   = "/home/boiler/boiler/furnace_power.json"   # Written by furnace_monitor.py
+THERMAL_CALIB_LOG    = "/home/boiler/boiler/thermal_calib.log"    # Thermal mass calibration data
 
 # --- Site-specific settings (IPs, credentials, location) ---
 # Imported from local.py which is gitignored and stays on the Pi.

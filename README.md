@@ -57,7 +57,8 @@ boiler/
 ├── force_emergency.txt     ← Created by --boost (transition mode); auto-deleted when boiler is warm
 ├── schedule.csv            ← Today's on/off plan, overwritten every 15 min
 ├── boiler.log              ← Log of every boiler decision
-└── furnace_monitor.log     ← Log of every furnace LED sample
+├── furnace_monitor.log     ← Log of every furnace LED sample
+└── thermal_calib.log       ← Thermal mass calibration data (away mode only)
 ```
 
 ---

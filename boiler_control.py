@@ -63,7 +63,7 @@ from config import (
     AWAY_WINTER_ACTIVATE_INDOOR_C, AWAY_WINTER_DEACTIVATE_INDOOR_C,
     AWAY_WINTER_ACTIVATE_OUTSIDE_C, AWAY_WINTER_DEACTIVATE_OUTSIDE_C,
     SERVER_HEARTBEAT_URL, SERVER_HEARTBEAT_TOKEN,
-    STATE_FILE, LOG_FILE, SCHEDULE_FILE, FURNACE_POWER_FILE,
+    STATE_FILE, LOG_FILE, SCHEDULE_FILE, FURNACE_POWER_FILE, THERMAL_CALIB_LOG,
 )
 
 logging.basicConfig(
@@ -71,6 +71,16 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(message)s",
     datefmt="%Y-%m-%d %H:%M",
+)
+
+_calib_log = logging.getLogger("thermal_calib")
+_calib_log.setLevel(logging.INFO)
+_calib_log.propagate = False
+_calib_log.addHandler(
+    logging.FileHandler(THERMAL_CALIB_LOG)
+)
+_calib_log.handlers[0].setFormatter(
+    logging.Formatter("%(asctime)s  %(message)s", datefmt="%Y-%m-%d %H:%M")
 )
 
 
@@ -662,6 +672,46 @@ def apply_furnace_correction(state: dict, now: datetime) -> None:
         pass
 
 
+# ── Thermal mass calibration (data capture) ──────────────────────────────────
+
+def log_thermal_calibration(state: dict, now: datetime, boiler_temp: float | None, occupancy: str) -> None:
+    """
+    Logs data for calibrating the boiler's thermal mass constant (m·c).
+
+    In away mode with the pump off, P_loss ≈ 0, so the energy balance simplifies:
+        P_in = m·c × dT / 0.25h   →   m·c = P_in × 0.25 / dT   (kWh/°C)
+
+    Logs only when: away mode (P_loss≈0), boiler temp available, prev_boiler_temp
+    in state (previous cycle), camera has fresh prev_quarter data, P_in > 0, dT > 0.
+    Grep "Thermal mass calibration" to extract the dataset for fitting.
+    """
+    if occupancy != "away" or boiler_temp is None:
+        return
+    prev_temp = state.get("prev_boiler_temp")
+    if prev_temp is None:
+        return
+    dT = boiler_temp - prev_temp
+    if dT <= 0:
+        return
+
+    try:
+        furnace   = json.loads(Path(FURNACE_POWER_FILE).read_text())
+        last_time = datetime.fromisoformat(furnace["current_time"])
+        if (now - last_time).total_seconds() > 120:
+            return
+        p_in = furnace.get("prev_quarter_avg_kw")
+        if not p_in or p_in <= 0:
+            return
+    except Exception:
+        return
+
+    implied_mass = p_in * 0.25 / dT   # kWh/°C
+    _calib_log.info(
+        f"dT={dT:+.2f}°C  P_in={p_in:.2f} kW  m·c={implied_mass:.3f} kWh/°C  "
+        f"boiler {prev_temp:.1f}→{boiler_temp:.1f}°C"
+    )
+
+
 # ── Duty override CLI helpers ─────────────────────────────────────────────────
 
 def increment_duty() -> None:
@@ -1184,6 +1234,9 @@ def main() -> None:
         prices, off_keys, boiler_temp_available,
         state["actuals"], occupancy, outside_temp, monthly_peak_kw, peak_window_peak_kw,
     )
+    log_thermal_calibration(state, now, corrected_boiler_temp if boiler_temp_available else None, occupancy)
+    if boiler_temp_available:
+        state["prev_boiler_temp"] = corrected_boiler_temp
     save_state(state)
 
     # 11. Log the decision
