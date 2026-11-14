@@ -24,11 +24,12 @@ activates automatically.
 |---|---|---|
 | Smart relay for boiler | **Shelly G3 Plus 1** | Wired into boiler's 230V tariff input |
 | Sensor expansion | **Shelly Plus Add-on** | Clips into the G3 Plus 1, adds DS18B20 support |
-| Boiler water temp | DS18B20 probe | Surface-mounted on boiler casing, calibrated via offset |
+| Boiler water temp | DS18B20 probe | Surface-mounted on boiler casing, calibrated via offset in Shelly app |
 | Indoor air temp | DS18B20 probe | Primary frost-guard sensor |
-| Radiator feed temp | DS18B20 probe | Logged only, not used for control decisions |
+| Radiator feed temp | DS18B20 probe | Used for feed-based duty floor in slow reheat |
 | Indoor temp fallback | Shelly H&T | Used if DS18B20 indoor sensor is unavailable |
 | Computer | Raspberry Pi | Any model with WiFi |
+| Furnace camera | **TAPO C200** | Monitors heating element LEDs for actual power draw; feeds into peak tracking |
 
 **NOTE:** Wiring the Shelly G3 Plus 1 into the boiler's tariff input
 (230V) must be done by a licensed electrician.
@@ -42,18 +43,21 @@ G3 Plus 1 enclosure. Power must be off when installing it.
 
 ```
 boiler/
-├── config.py            ← Tunable settings — tracked in git, safe to commit
-├── local.py             ← Site-specific values (IPs, keys, coordinates) — gitignored, stays on Pi
-├── local.example.py     ← Template for local.py
-├── boiler_control.py    ← Main Pi script
-├── shelly_watchdog.js   ← Watchdog script to install on the Shelly G3 Plus 1
-├── heartbeat.php        ← Upload to your web server (receives Pi pings)
-├── watchdog.php         ← Upload to your web server (run via cPanel cron)
+├── config.py               ← Tunable settings — tracked in git, safe to commit
+├── local.py                ← Site-specific values (IPs, keys, coordinates) — gitignored, stays on Pi
+├── local.example.py        ← Template for local.py
+├── boiler_control.py       ← Main Pi script (runs every 15 min via cron)
+├── furnace_monitor.py      ← Furnace LED monitor daemon (reads actual power draw via camera)
+├── shelly_watchdog.js      ← Watchdog script to install on the Shelly G3 Plus 1
+├── heartbeat.php           ← Upload to your web server (receives Pi pings)
+├── watchdog.php            ← Upload to your web server (run via cPanel cron)
 ├── boiler_state.json       ← Created automatically (persisted state: temps, actuals, monthly peak)
+├── furnace_power.json      ← Created by furnace_monitor.py (current + previous quarter LED readings)
 ├── slow_reheat_duty.txt    ← Created by --increment-duty; absent = use config default
 ├── force_emergency.txt     ← Created by --boost (transition mode); auto-deleted when boiler is warm
 ├── schedule.csv            ← Today's on/off plan, overwritten every 15 min
-└── boiler.log           ← Log of every decision
+├── boiler.log              ← Log of every boiler decision
+└── furnace_monitor.log     ← Log of every furnace LED sample
 ```
 
 ---
@@ -71,7 +75,7 @@ sudo mkdir -p /home/boiler/boiler
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo pip3 install requests --break-system-packages
+sudo pip3 install requests pillow --break-system-packages
 ```
 
 ### 3. Clone the repo and create local.py
@@ -127,10 +131,11 @@ LANG=en_US.UTF-8 tail -3 /home/boiler/boiler/boiler.log
 
 Expected log output:
 ```
-2026-01-15 03:00  Quarter 03:00 | Occupancy: home | Indoor: 18.5°C (read 03:00) | Outside: n/a | Boiler: 72.3°C | Feed: 45.1°C | 0.312 SEK/kWh | Boiler: OFF (scheduled off (expensive period))
-2026-01-15 08:00  Quarter 08:00 [PEAK] | Occupancy: home | Indoor: 18.2°C (read 07:55) | Outside: n/a | Boiler: 62.1°C | Feed: 38.2°C | 1.854 SEK/kWh | Boiler: OFF (peak window — holding off (boiler 62.1°C ≥ 40.0°C))
-2026-01-15 02:00  Quarter 02:00 | Occupancy: home | Indoor: 17.4°C (read 01:55) | Outside: n/a | Boiler: 58.3°C | Feed: 30.2°C | 0.218 SEK/kWh | Boiler: ON [slow] (slow reheat (58.3°C < 65.0°C))
-2026-01-15 04:00  Quarter 04:00 | Occupancy: away | Indoor: 11.2°C (read 03:55) | Outside: 3.1°C | Boiler: 52.3°C | Feed: 28.1°C | 0.310 SEK/kWh | Boiler: OFF (away frost protection active — scheduled off (expensive period))
+2026-01-15 03:00  Mode: home | Indoor: 18.5°C | Outside: -2.1°C | Boiler: 72.3°C | Feed: 45.1°C | 0.312 SEK/kWh | Peak: 2.1 kW | Winter peak: 0.0 kW | Boiler: OFF (scheduled off (expensive period))
+2026-01-15 08:15  Mode: home | Indoor: 18.2°C | Outside: -1.4°C | Boiler: 66.1°C | Feed: 38.2°C | 1.854 SEK/kWh | Peak: 2.1 kW | Winter peak: 0.9 kW | Boiler: OFF (peak window — holding off (boiler 66.1°C ≥ 65.0°C))
+2026-01-15 09:00  Mode: home | Indoor: 17.9°C | Outside: -0.8°C | Boiler: 58.3°C | Feed: 32.4°C | 2.102 SEK/kWh | Peak: 2.1 kW | Winter peak: 1.6 kW | Boiler: ON  (peak window slow reheat 58.3°C < 65.0°C, 10% duty)
+2026-01-15 02:00  Mode: home | Indoor: 17.4°C | Outside: -3.2°C | Boiler: 57.1°C | Feed: 30.2°C | 0.218 SEK/kWh | Peak: 2.1 kW | Winter peak: 1.6 kW | Boiler: ON  (slow reheat 57.1°C < 65.0°C, 31% duty)
+2026-01-15 04:00  Mode: away | Indoor: 11.2°C (read 03:55) | Outside: 3.1°C | Boiler: 52.3°C | Feed: 28.1°C | 0.310 SEK/kWh | Peak: 2.1 kW | Winter peak: 1.6 kW | Boiler: OFF (away frost protection active — scheduled off (expensive period))
 ```
 
 ### 6. Add to cron
@@ -190,6 +195,76 @@ The script runs a timer every minute on the Shelly itself, reads the
 Pi's heartbeat from local KVS, and forces the boiler ON if the Pi has
 been silent for 45 minutes while the boiler is OFF. This works entirely
 over the local network and is not affected by internet outages.
+
+### 11. Set up furnace LED monitor
+
+The furnace monitor samples the CTC 1100's heating element LEDs every 30 seconds
+via a TAPO C200 camera and go2rtc, providing actual power draw measurements that
+retroactively correct the duty-based peak estimates in `boiler_control.py`.
+
+**go2rtc** (if not already installed) handles the RTSP stream. Install from
+[github.com/AlexxIT/go2rtc](https://github.com/AlexxIT/go2rtc/releases) and
+add a systemd service. Then add the camera to `/etc/go2rtc.yaml`:
+
+```yaml
+streams:
+  furnace:
+    - rtsp://<user>:<pass>@<camera-ip>:554/stream2#backchannel=0&timeout=120
+```
+
+Where `<user>` and `<pass>` are the TAPO camera account credentials (set in the
+TAPO app under Advanced Settings → Camera Account — not your TP-Link account).
+Restart go2rtc and verify with:
+
+```bash
+curl "http://localhost:1984/api/frame.jpeg?src=furnace" -o test.jpg
+```
+
+**ffmpeg** is required by go2rtc for JPEG snapshots. If Homebridge is installed,
+its bundled binary can be symlinked rather than installing the full package:
+
+```bash
+sudo ln -s /var/lib/homebridge/node_modules/@homebridge-plugins/homebridge-camera-ffmpeg/node_modules/ffmpeg-for-homebridge/ffmpeg /usr/local/bin/ffmpeg
+```
+
+**LED calibration** — the three heating element indicators (2.25 / 4.5 / 9 kW)
+are hard-coded in `furnace_monitor.py` as pixel coordinates in the -90°-rotated
+camera frame. These are calibrated for a specific camera position; if you move
+the camera, recalibrate by running the helper script in the source comments.
+
+**Install as a systemd service:**
+
+```bash
+sudo tee /etc/systemd/system/furnace-monitor.service > /dev/null << 'EOF'
+[Unit]
+Description=Furnace LED monitor
+After=network.target go2rtc.service
+
+[Service]
+User=boiler
+WorkingDirectory=/home/boiler/boiler
+ExecStart=/usr/bin/python3 /home/boiler/boiler/furnace_monitor.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now furnace-monitor
+```
+
+Verify it's running and sampling:
+```bash
+sudo systemctl status furnace-monitor
+tail -f /home/boiler/boiler/furnace_monitor.log
+```
+
+After two boiler_control.py cycles, `boiler.log` will show `Furnace correction`
+lines whenever the actual LED reading differs by more than 1 kW from the
+duty-based estimate (typically when the boiler thermostat clips consumption
+at high temperatures).
 
 ### 10. Set up Homebridge occupancy switch
 
@@ -297,8 +372,8 @@ heating continues correctly across Pi reboots and power outages.
 
 Outside temperature is fetched from the
 [Open-Meteo API](https://open-meteo.com) (free, no API key required)
-using the property's coordinates. It is only fetched in Away mode —
-in Home mode `outside` shows as `n/a` in the log.
+using the property's coordinates. It is fetched on every run and shown
+in the log in both Home and Away mode.
 
 Frost protection is driven purely by outdoor and indoor temperatures —
 in summer, outdoor temperatures are high enough that frost risk never
@@ -365,7 +440,7 @@ Quarter 01:15 | ... | Boiler: ON [slow 31%] (slow reheat (58.3°C < 65.0°C, 31%
 for a very cold boiler during normal home use, not a peak-tariff risk,
 because the boiler is below 50°C only in unusual conditions.
 
-### Peak guard (Nov–Mar weekday 07:00–19:00)
+### Peak window demand tracking (Nov–Mar weekday 07:00–19:00)
 
 Degerfors Energi's effekttariff has two components:
 - **Effektavgift** — 50 kr/kW/month, based on the single worst hourly
@@ -373,16 +448,40 @@ Degerfors Energi's effekttariff has two components:
 - **Högbelastningsavgift** — 40 kr/kW/month (Nov–Mar only), based on
   the single worst hourly average during weekday 07:00–19:00.
 
-During the peak window, the script suppresses all heating unless the
-boiler drops below `PEAK_GUARD_TEMP_C` (40°C). Off-peak slow reheat
-(typically overnight in cheap price slots) pre-heats the boiler to ≥65°C,
-building a thermal buffer so it can coast through the morning peak without
-the element running at all.
+The script tracks two separate monthly peaks, both shown in every log line:
 
-The log marks peak-window runs with a `[PEAK]` tag:
-```
-Quarter 08:15 [PEAK] | ... | Boiler: OFF (peak window — holding off (boiler 63.5°C ≥ 40.0°C))
-```
+| Metric | Covers | Drives |
+|---|---|---|
+| `Peak` | All hours, all days | Effektavgift (50 kr/kW) |
+| `Winter peak` | Nov–Mar, weekday 07:00–19:00 only | Högbelastningsavgift (40 kr/kW) |
+
+**During the peak window** the script uses boiler temperature to decide:
+
+| Boiler temp | Action |
+|---|---|
+| ≥ 65°C (`SLOW_REHEAT_TRIGGER_C`) | Hold off — coast on stored heat |
+| 55–65°C | Price-scaled slow reheat, duty capped at `peak_window_effective_duty` |
+| < 55°C (`SLOW_REHEAT_MIN_C`) | Emergency full power (genuine safety) |
+
+`peak_window_effective_duty = max(SLOW_REHEAT_MIN_DUTY, peak_window_peak_kw / 9.0)` —
+the same auto-unlock pattern as `auto_duty` but restricted to the peak window budget.
+If the worst peak-window hour this month drew 3 kW, slow reheat during the peak window
+is capped at 33% duty (~3 kW average), which cannot worsen the tariff charge.
+
+This keeps the boiler warm enough for showers (60–68°C) while respecting the demand
+budget. Off-peak slow reheat (overnight cheap slots) pre-heats the boiler so it can
+coast through the morning peak.
+
+**Boost override** (`--boost`) bypasses the hold-off in home mode when the boiler
+is below `SLOW_REHEAT_TRIGGER_C`, running at the all-hours `auto_duty` rather than
+100% — faster than capped slow reheat without spiking the peak window budget. Boost
+has no effect in away mode.
+
+**Furnace LED correction** — `furnace_monitor.py` samples the actual heating element
+LEDs every 30s and retroactively corrects the previous quarter's kW entry in the peak
+logs. This matters when the boiler thermostat clips actual consumption below the
+commanded duty (common at high boiler temperatures). A `Furnace correction` line
+appears in `boiler.log` whenever the correction exceeds 1 kW.
 
 ### Slow-reheat duty override
 
@@ -403,6 +502,9 @@ field shown in the log and schedule file. If the monthly peak already exceeds
 what slow reheat at the current duty would draw, limiting the duty no longer
 protects the tariff — the script automatically raises the effective duty to
 match, so you get faster heating for free.
+
+The duty-based estimates are retroactively corrected by `furnace_monitor.py`
+using actual LED readings (see Peak window demand tracking above).
 
 ### Away→home transition warm-up
 
@@ -657,10 +759,13 @@ cat /home/boiler/boiler/schedule.csv
   locally on the Pi. Future improvement: ship log entries to a time-series
   database (e.g. InfluxDB Cloud) for long-term analysis and visualisation
   without relying on the Pi's SD card.
-- **Radiator feed temperature is logged but unused** — the feed sensor
-  provides useful context for understanding how quickly the boiler cools
-  under different heat demand conditions. After a full season of data,
-  this could inform more sophisticated control logic.
+- **Furnace monitor requires fixed camera position** — LED pixel coordinates
+  in `furnace_monitor.py` are calibrated for a specific camera mount. If the
+  camera is moved, run the calibration helper (described in the script's
+  comments) to find new coordinates.
+- **Furnace monitor is a best-effort correction** — if go2rtc or the camera
+  is unavailable, `boiler_control.py` falls back silently to duty-based
+  estimates. The boiler control loop itself has no dependency on the monitor.
 - **Remote watchdog false alarms on internet outage** — the cPanel email
   watchdog cannot distinguish between a Pi crash and a home internet
   outage. The local Shelly watchdog handles actual boiler safety; the

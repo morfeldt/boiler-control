@@ -63,7 +63,7 @@ from config import (
     AWAY_WINTER_ACTIVATE_INDOOR_C, AWAY_WINTER_DEACTIVATE_INDOOR_C,
     AWAY_WINTER_ACTIVATE_OUTSIDE_C, AWAY_WINTER_DEACTIVATE_OUTSIDE_C,
     SERVER_HEARTBEAT_URL, SERVER_HEARTBEAT_TOKEN,
-    STATE_FILE, LOG_FILE, SCHEDULE_FILE,
+    STATE_FILE, LOG_FILE, SCHEDULE_FILE, FURNACE_POWER_FILE,
 )
 
 logging.basicConfig(
@@ -621,6 +621,47 @@ def record_power_draw(
     return monthly_peak_kw, peak_window_peak_kw
 
 
+# ── Furnace LED monitor integration ──────────────────────────────────────────
+
+def apply_furnace_correction(state: dict, now: datetime) -> None:
+    """
+    Retroactively corrects the previous quarter's kW entry in the monthly log
+    with the actual measured draw from furnace_monitor.py.
+
+    furnace_monitor accumulates per-quarter LED samples and archives the completed
+    quarter as prev_quarter_* before resetting. We read that archived value here
+    and overwrite the duty-based estimate we recorded 15 minutes ago.
+
+    Only corrects if the furnace data is fresh (< 2 min old) and the previous
+    quarter key exists in our log — orphan entries are never created.
+    Logs at INFO only when the correction differs by more than 1 kW (meaningful
+    thermostat-clipping event worth noting).
+    """
+    try:
+        furnace   = json.loads(Path(FURNACE_POWER_FILE).read_text())
+        last_time = datetime.fromisoformat(furnace["current_time"])
+        if (now - last_time).total_seconds() > 120:
+            return
+
+        prev_key = furnace.get("prev_quarter_key")
+        prev_kw  = furnace.get("prev_quarter_avg_kw")
+        if prev_key is None or prev_kw is None:
+            return
+
+        for log_key in ("monthly_kw_log", "peak_window_kw_log"):
+            log = state.get(log_key, {})
+            if prev_key in log:
+                old_kw = log[prev_key]
+                log[prev_key] = prev_kw
+                if abs(prev_kw - old_kw) > 1.0:
+                    logging.info(
+                        f"Furnace correction {prev_key}: "
+                        f"{old_kw:.1f} kW → {prev_kw:.1f} kW (actual)"
+                    )
+    except Exception:
+        pass
+
+
 # ── Duty override CLI helpers ─────────────────────────────────────────────────
 
 def increment_duty() -> None:
@@ -1134,6 +1175,7 @@ def main() -> None:
     else:
         power_kw = 9.0 if boiler_on else 0.0
         set_boiler(boiler_on)
+    apply_furnace_correction(state, now)
     monthly_peak_kw, peak_window_peak_kw = record_power_draw(state, now, power_kw, in_peak_window=peak)
 
     # 10. Record actual, write schedule file, save state
